@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# SwiftPM
+.build/
+.swiftpm/
+
+# Editor / language server (machine-specific paths — regenerate via scripts/gen-compile-commands.sh)
+compile_commands.json
+.index-build/
+
+# Claude Code local settings
+.claude/settings.local.json
