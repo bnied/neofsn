@@ -62,14 +62,22 @@ struct SceneHostView: NSViewRepresentable {
         private var lastRootID: UUID?
         private var lastFocusToken: Int = 0
         private var lastResetToken: Int = 0
+        private var lastColorRebuildToken: Int = 0
         private var lastHalfExtent: CGFloat = 8
         private var focusedSubdir: SCNNode?
         private var focusLabelNodes: [SCNNode] = []
         private var levels: [Level] = []
         private var lastSelectedPath: String?
-        private var tiltedNode: SCNNode?
-        private var tiltSavedEuler: SCNVector3?
-        private var tiltSavedPos: SCNVector3?
+        private var spotlightNode: SCNNode?
+        private var coronaNode: SCNNode?
+        private var coneNode: SCNNode?
+        private let coronaBaseSize: CGFloat = 4.0
+        // Cone roughly 1.5× cell-pitch tall — clearly a beam from above, but not
+        // so tall it visually projects across rows behind from a tilted camera.
+        private let liftHeight: CGFloat = 3.6
+        private let coneBaseHeight: CGFloat = 3.6
+        private let coneBaseTopRadius: CGFloat = 0.05
+        private let coneBaseBottomRadius: CGFloat = 1.0
         private var hoveredNode: SCNNode?
         private var hoverSavedEmission: Any?
         private var keyMonitor: Any?
@@ -96,6 +104,9 @@ struct SceneHostView: NSViewRepresentable {
             self.flyCamera = FlyCameraController(cameraNode: cameraNode)
             super.init()
             configureLights()
+            configureSelectionSpotlight()
+            configureSelectionCorona()
+            configureSelectionCone()
         }
 
         /// Install the three-point-ish lighting rig (warm key + cool fill + ambient).
@@ -149,12 +160,25 @@ struct SceneHostView: NSViewRepresentable {
 
         func syncFromViewModel() {
             guard let root = viewModel.currentRoot else { return }
-            guard lastRootID != root.id else { return }
+            SceneBuilder.colorMode = viewModel.colorMode
+
+            let colorChanged = viewModel.colorRebuildToken != lastColorRebuildToken
+            let rootChanged = lastRootID != root.id
+            guard rootChanged || colorChanged else { return }
             lastRootID = root.id
+            lastColorRebuildToken = viewModel.colorRebuildToken
             clearHover()
             clearFocusLabels()
-            clearSelectionTilt()
+            hideSpotlight()
             focusedSubdir = nil
+
+            // A color-mode swap with no navigation: walk every file slab in the
+            // scene and reapply diffuse colors. Cheap, geometry stays put, the
+            // camera frame is preserved.
+            if colorChanged && !rootChanged {
+                SceneBuilder.recolorFileSlabs(under: scene.rootNode)
+                return
+            }
 
             let path = root.url.path
             if let idx = levels.firstIndex(where: { $0.url.path == path }) {
@@ -177,7 +201,8 @@ struct SceneHostView: NSViewRepresentable {
         }
 
         private func pushLevel(root: FileSystemNode) {
-            let (node, halfExtent) = SceneBuilder.makeLevelNode(root: root)
+            let parentURL = navigableParentURL(for: root.url)
+            let (node, halfExtent) = SceneBuilder.makeLevelNode(root: root, parentURL: parentURL)
             let center: SCNVector3
             if let top = levels.last {
                 // Place the child BESIDE and just below the parent: offset in +X by both
@@ -280,36 +305,283 @@ struct SceneHostView: NSViewRepresentable {
             focusLabelNodes.removeAll()
         }
 
-        // MARK: - Selection tilt (raise the selected file like an opened document)
+        // MARK: - Selection spotlight + corona (FSN-style warm pool of light on the selected item)
+
+        /// Persistent spot light parked off-stage at zero intensity. When something
+        /// is selected we animate its position over the item, size the cone to the
+        /// item's footprint, and ramp intensity up; deselection just fades it out.
+        private func configureSelectionSpotlight() {
+            let node = SCNNode()
+            let light = SCNLight()
+            light.type = .spot
+            light.color = NSColor(calibratedRed: 1.0, green: 0.92, blue: 0.78, alpha: 1)
+            light.intensity = 0
+            light.attenuationStartDistance = 1.5
+            light.attenuationEndDistance = 14
+            light.castsShadow = false
+            node.light = light
+            node.name = "selectionSpotlight"
+            // Aim straight down (-Y). Only position + cone angles change at runtime.
+            node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
+            scene.rootNode.addChildNode(node)
+            spotlightNode = node
+        }
+
+        /// A flat warm-gradient disc that sits on the surface beneath the selected
+        /// item — the visible "circle of light" around the item. Scales with the
+        /// item's footprint.
+        private func configureSelectionCorona() {
+            let plane = SCNPlane(width: coronaBaseSize, height: coronaBaseSize)
+            let mat = SCNMaterial()
+            mat.lightingModel = .constant
+            // Texture lives in diffuse so `transparencyMode = .aOne` reads the
+            // gradient's actual alpha. (Putting it in emission with diffuse=clear
+            // made the entire material transparent — that was the long-standing
+            // reason the halo was never showing up.)
+            mat.diffuse.contents = Self.makeCoronaTexture()
+            mat.transparencyMode = .aOne
+            mat.isDoubleSided = true
+            mat.writesToDepthBuffer = false
+            mat.readsFromDepthBuffer = true
+            // Trilinear with mipmaps + edge clamping. Without mipFilter = .linear
+            // the texture is sampled with point-LOD at oblique viewing angles,
+            // producing diagonal moiré bands across the halo. Clamping the wrap
+            // mode also prevents the gradient from tiling at the plane edges.
+            mat.diffuse.minificationFilter = .linear
+            mat.diffuse.magnificationFilter = .linear
+            mat.diffuse.mipFilter = .linear
+            mat.diffuse.wrapS = .clamp
+            mat.diffuse.wrapT = .clamp
+            plane.firstMaterial = mat
+
+            let node = SCNNode(geometry: plane)
+            // Lay flat (facing +Y) so it sits on the surface like the existing labels.
+            node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
+            node.opacity = 0
+            node.renderingOrder = 5
+            node.castsShadow = false
+            node.name = "selectionCorona"
+            scene.rootNode.addChildNode(node)
+            coronaNode = node
+        }
+
+        /// A translucent warm-tinted cone of "volumetric" light from the spotlight
+        /// source down to the selected item. Apex narrow (point source), base wide
+        /// (matches the spot's pool). Cone is recycled across selections.
+        private func configureSelectionCone() {
+            let cone = SCNCone(
+                topRadius: coneBaseTopRadius,
+                bottomRadius: coneBaseBottomRadius,
+                height: coneBaseHeight
+            )
+            // 96 radial wedges (up from the default 48) so the cone's silhouette
+            // and any visible triangle edges read as a smooth circle rather than
+            // a faceted polygon, even at wide bottom radii.
+            cone.radialSegmentCount = 96
+            let mat = SCNMaterial()
+            mat.lightingModel = .constant
+            mat.diffuse.contents = NSColor(calibratedRed: 1.0, green: 0.88, blue: 0.55, alpha: 0.16)
+            mat.emission.contents = NSColor(calibratedRed: 1.0, green: 0.84, blue: 0.50, alpha: 0.16)
+            mat.transparencyMode = .aOne
+            mat.isDoubleSided = true
+            mat.writesToDepthBuffer = false
+            mat.readsFromDepthBuffer = true
+            mat.cullMode = .back
+            cone.firstMaterial = mat
+
+            let node = SCNNode(geometry: cone)
+            node.opacity = 0
+            node.renderingOrder = 4
+            node.castsShadow = false
+            node.name = "selectionCone"
+            scene.rootNode.addChildNode(node)
+            coneNode = node
+        }
 
         func handleSelectionChange() {
             let path = viewModel.selectedURL?.path
             if path == lastSelectedPath { return }
             lastSelectedPath = path
-            clearSelectionTilt()
-            guard let path, let node = findNode(forPath: path), node.name == "file" else { return }
-            tiltSavedEuler = node.eulerAngles
-            tiltSavedPos = node.position
-            tiltedNode = node
-            // First lift the slab clear of the folder plate, THEN tilt it — so its
-            // bottom edge never dips into the surrounding polygons. Positive X rotation
-            // lifts the back edge so the top face (icon + label) faces the camera.
-            let lift = SCNAction.moveBy(x: 0, y: 0.8, z: 0, duration: 0.16)
-            lift.timingMode = .easeOut
-            let tilt = SCNAction.rotateTo(x: CGFloat.pi * 0.32, y: 0, z: 0, duration: 0.22, usesShortestUnitArc: true)
-            tilt.timingMode = .easeInEaseOut
-            node.runAction(.sequence([lift, tilt]))
+            guard let path, let node = findNode(forPath: path),
+                  node.name == "file" || node.name == "pedestal:subdir" else {
+                hideSpotlight()
+                return
+            }
+            moveSpotlight(to: node)
         }
 
-        private func clearSelectionTilt() {
-            if let n = tiltedNode {
-                n.removeAllActions()
-                if let e = tiltSavedEuler { n.eulerAngles = e }
-                if let p = tiltSavedPos { n.position = p }
+        /// Position the spotlight + corona + cone over `target`, sizing the cone so
+        /// its bright inner pool covers the whole item and the outer pool fades just
+        /// beyond its edges.
+        private func moveSpotlight(to target: SCNNode) {
+            guard let spot = spotlightNode, let light = spot.light else { return }
+            let world = target.worldPosition
+            let halfH = boxHeight(target) / 2
+            let itemBaseY = world.y - halfH
+            let lightY = world.y + liftHeight
+            // No min clamp — tiny mini-files on packed pedestals deserve tiny
+            // halos, not 2.4-wide pools that drown their neighbors.
+            let half = footprint(target) * 0.5
+            // Cone's outer radius matches the corona's outer extent (= half × 2.4)
+            // so the volumetric cone tapers down to the same circle of light on
+            // the floor — the two effects read as a single coherent spotlight.
+            let outerRadius = half * 2.4
+            // Spot's outer cone reaches `outerRadius` at the item's BASE (= floor
+            // for root items, parent platform top for nested items). That way the
+            // visible cone matches the actual lit pool, and the cone bottom sits
+            // on the same surface the item rests on.
+            let outerDeg = atan(outerRadius / (lightY - itemBaseY)) * 180 / .pi
+            let innerDeg = outerDeg * 0.55
+
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.28
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
+            spot.position = SCNVector3(world.x, lightY, world.z)
+            light.spotInnerAngle = innerDeg
+            light.spotOuterAngle = outerDeg
+            // Intensity 0: the actual SCN light is off (it was the source of the
+            // specular hotspot on the icon). All visible feedback comes from the
+            // slab's emission glow, the visible cone, and the corona.
+            light.intensity = 0
+            SCNTransaction.commit()
+
+            moveCorona(to: target)
+            moveCone(to: target, bottomRadius: outerRadius, itemBaseY: itemBaseY, lightY: lightY)
+        }
+
+        /// Position the volumetric cone with its narrow apex at the spotlight
+        /// source and its wide base on the item's *top* surface (not the floor).
+        /// Critical: if the cone reached the floor it would overlap the corona
+        /// plane and its radial wedge triangles would show as visible spokes
+        /// across the halo. Ending the cone at the item top leaves the floor
+        /// halo unobstructed.
+        private func moveCone(to target: SCNNode, bottomRadius: CGFloat, itemBaseY: CGFloat, lightY: CGFloat) {
+            guard let cone = coneNode else { return }
+            let world = target.worldPosition
+            let itemTopY = world.y + boxHeight(target) / 2
+            let coneHeight = lightY - itemTopY
+            let centerY = (lightY + itemTopY) / 2
+            // X/Z scale = circular radius scale (keeps the cone round). Y scale
+            // stretches the cone vertically so its base sits exactly on the
+            // item's TOP face and its apex at the light source.
+            let radialScale = bottomRadius / coneBaseBottomRadius
+            let yScale = coneHeight / coneBaseHeight
+
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.28
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
+            cone.position = SCNVector3(world.x, centerY, world.z)
+            cone.scale = SCNVector3(radialScale, yScale, radialScale)
+            cone.opacity = 1.0
+            SCNTransaction.commit()
+        }
+
+        /// Position the corona disc at the base of `target` and scale it so its
+        /// visible bright ring lands clearly outside the item's footprint — a
+        /// proper halo around the item, not a thin sliver at its edge.
+        private func moveCorona(to target: SCNNode) {
+            guard let corona = coronaNode else { return }
+            let world = target.worldPosition
+            // Sit just above the target's bottom face (= floor or platform top).
+            let baseY = world.y - boxHeight(target) / 2 + 0.012
+            // Halo extent = footprint × 2.4 — no min clamp so mini items get
+            // proportionally small halos and don't drown their neighbors.
+            let extent = footprint(target) * 2.4
+            let scale = extent / coronaBaseSize
+
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.28
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
+            corona.position = SCNVector3(world.x, baseY, world.z)
+            corona.scale = SCNVector3(scale, scale, scale)
+            corona.opacity = 1.0
+            SCNTransaction.commit()
+        }
+
+        /// Ramp the spotlight, corona, and visible cone to zero (parked).
+        private func hideSpotlight() {
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.20
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeIn)
+            spotlightNode?.light?.intensity = 0
+            coronaNode?.opacity = 0
+            coneNode?.opacity = 0
+            SCNTransaction.commit()
+        }
+
+        /// Largest horizontal extent of an interactive node's box geometry.
+        /// Falls back to one grid cell for non-box geometries.
+        private func footprint(_ node: SCNNode) -> CGFloat {
+            if let box = node.geometry as? SCNBox {
+                return max(box.width, box.length)
             }
-            tiltedNode = nil
-            tiltSavedEuler = nil
-            tiltSavedPos = nil
+            return CGFloat(SceneBuilder.cellSize)
+        }
+
+        /// Vertical extent of an interactive node's box geometry (zero if not a box).
+        private func boxHeight(_ node: SCNNode) -> CGFloat {
+            (node.geometry as? SCNBox)?.height ?? 0
+        }
+
+        /// Radial-gradient bitmap used as the corona's diffuse map. Warm amber
+        /// ring fading to fully-transparent at the edge.
+        ///
+        /// Rendered into a 16-bits-per-channel `NSBitmapImageRep` rather than via
+        /// `NSImage.lockFocus()` (which is 8-bit). With only 256 alpha levels the
+        /// gradient quantizes into visible diagonal bands when the corona is
+        /// viewed at an oblique angle — 16-bit precision keeps the falloff smooth.
+        private static func makeCoronaTexture() -> NSImage {
+            let pixels = 1024
+            let size = CGFloat(pixels)
+            guard let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: pixels,
+                pixelsHigh: pixels,
+                bitsPerSample: 16,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0
+            ), let nsctx = NSGraphicsContext(bitmapImageRep: rep) else {
+                return NSImage(size: NSSize(width: size, height: size))
+            }
+            rep.size = NSSize(width: size, height: size)
+
+            NSGraphicsContext.saveGraphicsState()
+            defer { NSGraphicsContext.restoreGraphicsState() }
+            NSGraphicsContext.current = nsctx
+            let ctx = nsctx.cgContext
+
+            let center = CGPoint(x: size / 2, y: size / 2)
+            // Single smooth ring: one continuous bump from 0 → peak → 0. The
+            // previous four-stop curve [0, 0.55, 0.85, 1] / [0, 0.90, 0.55, 0]
+            // had a deliberate brightness drop between 55% and 85% radius, which
+            // the eye saw as a dark concentric ring between two bright bands —
+            // the very "two-rings" artifact in the latest screenshot. With three
+            // stops there's nothing to interpret as a secondary band.
+            let colors = [
+                NSColor(calibratedRed: 1.00, green: 0.88, blue: 0.58, alpha: 0.00).cgColor,
+                NSColor(calibratedRed: 1.00, green: 0.84, blue: 0.50, alpha: 0.80).cgColor,
+                NSColor(calibratedRed: 1.00, green: 0.72, blue: 0.32, alpha: 0.00).cgColor,
+            ] as CFArray
+            if let gradient = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: colors,
+                locations: [0, 0.5, 1]
+            ) {
+                ctx.drawRadialGradient(
+                    gradient,
+                    startCenter: center, startRadius: 0,
+                    endCenter: center, endRadius: size / 2,
+                    options: []
+                )
+            }
+
+            let image = NSImage(size: NSSize(width: size, height: size))
+            image.addRepresentation(rep)
+            return image
         }
 
         // MARK: - Focus request (sidebar → 3D)
@@ -414,7 +686,7 @@ struct SceneHostView: NSViewRepresentable {
             if keyMonitor != nil { return }
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
                 guard let self else { return event }
-                return MainActor.assumeIsolated { self.handleMonitoredEvent(event) }
+                return self.handleMonitoredEvent(event)
             }
         }
 
@@ -448,12 +720,16 @@ struct SceneHostView: NSViewRepresentable {
         /// click on empty space deselects and resets the view.
         func handleClickAt(point: CGPoint, clickCount: Int) {
             guard let view = scnView else { return }
+            // Search ALL hits, not just the closest — the topmost hit may be a
+            // non-interactive helper (selection corona/cone), and we want to fall
+            // through to the actual item underneath rather than treating the
+            // click as empty-space (which would deselect).
             let hits = view.hitTest(point, options: [
                 .ignoreHiddenNodes: true,
-                .searchMode: SCNHitTestSearchMode.closest.rawValue,
+                .searchMode: SCNHitTestSearchMode.all.rawValue,
             ])
-            guard let first = hits.first, let target = interactiveAncestor(of: first.node) else {
-                // Clicking empty space deselects and re-frames the whole folder.
+            guard let target = hits.lazy.compactMap({ self.interactiveAncestor(of: $0.node) }).first else {
+                // No interactive item under the cursor → genuinely empty space.
                 viewModel.select(nil)
                 resetView()
                 return
@@ -461,6 +737,11 @@ struct SceneHostView: NSViewRepresentable {
             let path = target.value(forKey: "fsURL") as? String
             let url = path.map { URL(fileURLWithPath: $0) }
 
+            if target.name == "navup", let url {
+                // Back-up tile: any click → navigate to parent.
+                viewModel.navigate(to: url)
+                return
+            }
             if clickCount >= 2 {
                 // Double click → navigate / open
                 if target.name == "file", let url {
@@ -484,12 +765,26 @@ struct SceneHostView: NSViewRepresentable {
             }
         }
 
+        /// The URL we should navigate to from a back-up tile inside `levelURL`,
+        /// or nil if `levelURL` is already at (or above) the opened root.
+        private func navigableParentURL(for levelURL: URL) -> URL? {
+            guard let opened = viewModel.openedRootURL else { return nil }
+            let parent = levelURL.deletingLastPathComponent()
+            // Back is only meaningful when we'd stay at or below the opened root.
+            if parent.path == opened.path || parent.path.hasPrefix(opened.path + "/") {
+                return parent
+            }
+            return nil
+        }
+
         /// Hit-test under the cursor and update the hover highlight + HUD target.
         func handleHoverAt(point: CGPoint) {
             guard let view = scnView else { return }
+            // Same as click: walk all hits so selection helpers (corona/cone)
+            // don't shadow the actual item beneath the cursor.
             let hits = view.hitTest(point, options: [
                 .ignoreHiddenNodes: true,
-                .searchMode: SCNHitTestSearchMode.closest.rawValue,
+                .searchMode: SCNHitTestSearchMode.all.rawValue,
             ])
             let target = hits.lazy.compactMap { self.interactiveAncestor(of: $0.node) }.first
             setHover(target)
@@ -509,11 +804,13 @@ struct SceneHostView: NSViewRepresentable {
 
         // MARK: - Hover highlight
 
-        /// Walk up from a hit node to the nearest interactive ancestor (file or folder).
+        /// Walk up from a hit node to the nearest interactive ancestor (file,
+        /// folder, or back-up tile).
         private func interactiveAncestor(of node: SCNNode) -> SCNNode? {
             var current: SCNNode? = node
             while let n = current {
-                if let name = n.name, name == "file" || name == "pedestal:subdir" {
+                if let name = n.name,
+                   name == "file" || name == "pedestal:subdir" || name == "navup" {
                     return n
                 }
                 current = n.parent
@@ -530,7 +827,8 @@ struct SceneHostView: NSViewRepresentable {
             let highlight: NSColor
             switch node.name {
             case "pedestal:subdir":
-                highlight = NSColor(calibratedRed: 0.30, green: 0.20, blue: 0.05, alpha: 1)
+                // Cool-neutral hover tint that complements the blue folders.
+                highlight = NSColor(calibratedRed: 0.10, green: 0.14, blue: 0.22, alpha: 1)
             default:
                 highlight = NSColor(calibratedWhite: 0.22, alpha: 1)
             }

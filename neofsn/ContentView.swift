@@ -7,14 +7,27 @@ struct ContentView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(viewModel: viewModel)
-                .navigationSplitViewColumnWidth(min: 240, ideal: 300, max: 480)
-        } detail: {
-            detailContent
+        ZStack {
+            // Opaque base layer behind everything — paints corner-to-corner of
+            // the window including any safe-area inset and any region that
+            // SwiftUI's NavigationSplitView / toolbar chrome wouldn't normally
+            // cover. If the fullscreen stripe is a gap where the backdrop never
+            // reaches, this fills it. If the stripe survives even with this in
+            // place, it's a layer being painted *on top* of content (Liquid
+            // Glass material) and needs a different attack.
+            Theme.backdrop.ignoresSafeArea(.all)
+
+            NavigationSplitView(columnVisibility: $columnVisibility) {
+                SidebarView(viewModel: viewModel)
+                    .navigationSplitViewColumnWidth(min: 240, ideal: 300, max: 480)
+            } detail: {
+                detailContent
+            }
+            .frame(minWidth: 1100, minHeight: 720)
+            .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+            .toolbar(removing: .title)
         }
-        .frame(minWidth: 1100, minHeight: 720)
-        .background(Theme.backdrop)
+        .containerBackground(Theme.backdrop, for: .window)
         .preferredColorScheme(.dark)
         .focusable()
         .onKeyPress(.space) {
@@ -206,6 +219,10 @@ private struct TopBar: View {
 
             Rectangle().fill(Theme.hairline).frame(width: 0.5, height: 18)
 
+            ColorModeToggle(mode: $viewModel.colorMode)
+
+            Rectangle().fill(Theme.hairline).frame(width: 0.5, height: 18)
+
             iconButton(systemName: "scope", help: "Reset View (⌘0)") {
                 viewModel.requestResetView()
             }
@@ -318,5 +335,42 @@ private struct PathBreadcrumbs: View {
         } else {
             label
         }
+    }
+}
+
+// MARK: - Color mode toggle
+
+/// Two-segment switch in the top bar between age-heatmap and file-type coloring.
+private struct ColorModeToggle: View {
+    @Binding var mode: ColorMode
+
+    var body: some View {
+        HStack(spacing: 0) {
+            segment(label: "age", value: .age, help: "Color by modification age")
+            segment(label: "type", value: .type, help: "Color by file type")
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 3)
+                .stroke(Theme.hairline, lineWidth: 0.5)
+        )
+    }
+
+    @ViewBuilder
+    private func segment(label: String, value: ColorMode, help: String) -> some View {
+        let selected = mode == value
+        Button {
+            mode = value
+        } label: {
+            Text(label)
+                .font(Theme.caps(9))
+                .tracking(2.0)
+                .textCase(.uppercase)
+                .foregroundStyle(selected ? Theme.backdrop : Theme.textSecondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(selected ? Theme.accent : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }

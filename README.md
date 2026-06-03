@@ -1,10 +1,14 @@
+<p align="center">
+  <img src="docs/icon.png" width="160" alt="neofsn app icon" />
+</p>
+
 # neofsn
 
 > **Status: beta.** neofsn is under active development. Expect rough edges, changing behavior, and the occasional bug.
 >
 > **Requires macOS 14 (Sonoma) or later.**
 
-A spatial filesystem navigator for macOS — a modern homage to SGI's **FSN** (the "File System Navigator" famously shown as the 3D UNIX interface in *Jurassic Park*). Folders become plates, files become slabs you fly through, and color encodes file age. Built with SwiftUI for the shell and SceneKit for the 3D scene.
+A spatial filesystem navigator for macOS — a modern homage to SGI's **FSN** (the "File System Navigator" famously shown as the 3D UNIX interface in *Jurassic Park*). Folders become blue platforms, files become flat slabs you fly through, and a warm volumetric spotlight marks whatever you've selected. Built with SwiftUI for the shell and SceneKit for the 3D scene.
 
 > *"It's a UNIX system. I know this."*
 
@@ -12,16 +16,16 @@ A spatial filesystem navigator for macOS — a modern homage to SGI's **FSN** (t
 
 ## Features
 
-- **3D folder visualization.** Each folder is a plate; its files are flat slabs and its subfolders are raised platforms carrying their own contents.
+- **3D folder visualization.** Each folder is a plate; its files are flat slabs and its subfolders are raised macOS-blue platforms carrying their own contents.
 - **Fly camera.** WASD / arrow keys to move, `Q`/`E` to change altitude, drag to look, scroll to dolly. Hold `Shift` to move faster.
-- **Age heat-map coloring** (FSN-style): bright red = touched this week → through orange, yellow, green, teal, blue → purple for files older than a year.
-- **File-type icons** stamped on each slab (code, images, audio, video, docs, archives, shell scripts, apps, …).
+- **Configurable coloring** — toggle between **age heat-map** (FSN-style: red this week → through orange, yellow, green, teal, blue → purple for >1 year) and **file-type palette** (categorical: code, images, audio, video, docs, archives, config, …). Switch live from the top bar; the scene recolors in place without a rescan.
+- **File-type icons** stamped on each slab using a shared `FileKind` taxonomy that drives both the icon and the type-mode color.
 - **Layered descent.** Stepping into a subfolder drops a new plate beside-and-below the current one and pans the camera to it — the parent stays on screen, so you keep your bearings instead of losing context to a full redraw.
 - **Hierarchical sidebar** mirroring the tree, with two-way sync: pick something in 3D and the sidebar scrolls to it; click in the sidebar and the camera flies to it.
 - **Interactive breadcrumb bar** — jump to any ancestor folder with a click.
-- **Selection feedback** — the selected file lifts off its plate and tilts toward the camera like an opened document.
-- **Metadata HUD** with kind, size, modified date, and age for the focused item.
-- **Finder integration & Quick Look** — open in the default app (`⇧⌘O`), reveal in Finder (`⌘R`), or press `Space` to Quick Look the selection.
+- **FSN-style selection spotlight.** The selected item gets a translucent warm volumetric cone of light descending from above, a glowing halo on the floor around its base, and a subtle illumination on the item itself — the app's signature visual.
+- **Expanded metadata HUD** with kind chip, name, full path, size (or file/subdir count for folders), modified/created dates, permissions (`rwx`), and age — plus an inline action strip: Quick Look, Open, Copy Path (`⇧⌘C`), Reveal in Finder, and Descend (for folders).
+- **Finder integration & Quick Look** — open in the default app (`⇧⌘O`), reveal in Finder (`⌘R`), copy path (`⇧⌘C`), or press `Space` to Quick Look the selection.
 - **Reset view** (`⌘0`, the scope button, or click empty space) re-frames the current folder.
 
 ## Requirements
@@ -64,6 +68,7 @@ On first launch the 3D view is empty. Click **Open…** (or press `⌘O`) and ch
 | Quick Look | `Space` |
 | Open in default app | `⇧⌘O` |
 | Reveal in Finder | `⌘R` |
+| Copy path | `⇧⌘C` |
 | Open folder… | `⌘O` |
 | Back | `⌘[` |
 | Reset view | `⌘0` |
@@ -77,6 +82,7 @@ neofsn/
 ├── BrowserViewModel.swift   # Navigation state, scanning, selection, focus requests
 ├── QuickLookPreview.swift   # QLPreviewPanel bridge
 ├── Model/
+│   ├── FileKind.swift           # File-type taxonomy (icon symbols + type-mode palette)
 │   ├── FileSystemNode.swift     # Tree node model
 │   └── FileSystemScanner.swift  # Async directory scanner
 ├── Scene/

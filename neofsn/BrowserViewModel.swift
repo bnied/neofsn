@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import Quartz
 
 @MainActor
 final class BrowserViewModel: ObservableObject {
@@ -32,6 +33,18 @@ final class BrowserViewModel: ObservableObject {
     /// Incremented to ask the 3D scene to re-frame the whole current folder.
     @Published private(set) var resetViewToken: Int = 0
     func requestResetView() { resetViewToken += 1 }
+
+    /// Active strategy for coloring file slabs in the 3D scene. Changing this
+    /// bumps `colorRebuildToken` so the scene rebuilds with the new palette.
+    @Published var colorMode: ColorMode = .age {
+        didSet {
+            guard oldValue != colorMode else { return }
+            colorRebuildToken += 1
+        }
+    }
+    /// Incremented when `colorMode` changes; the scene coordinator watches this
+    /// to know it must rebuild the level stack with new materials.
+    @Published private(set) var colorRebuildToken: Int = 0
 
     private var history: [URL] = []
 
@@ -179,5 +192,19 @@ final class BrowserViewModel: ObservableObject {
     func revealInFinder() {
         guard let url = actionableURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    /// Copy the actionable item's full path to the system pasteboard.
+    func copyPath() {
+        guard let url = actionableURL else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(url.path, forType: .string)
+    }
+
+    /// Show (or update) the Quick Look panel for the actionable item.
+    func quickLook() {
+        guard let url = actionableURL else { return }
+        QuickLookPreview.shared.preview(url: url)
     }
 }

@@ -12,9 +12,7 @@ struct SidebarView: View {
             Divider().background(Theme.hairline)
             content
         }
-        // Extend the panel under the top safe area so the title-bar strip is filled
-        // (the header already pads down to clear the traffic lights).
-        .background(Theme.panel.ignoresSafeArea(edges: .top))
+        .background(Theme.panel)
     }
 
     private var header: some View {
@@ -84,9 +82,10 @@ private struct NodeRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            // Accent rail (only when current)
+            // Folder-blue rail (only when current) — consistent with the folder
+            // icon color and the in-scene blue plates.
             Rectangle()
-                .fill(isCurrent ? Theme.accent : Color.clear)
+                .fill(isCurrent ? Theme.folder : Color.clear)
                 .frame(width: 2)
 
             Image(systemName: icon)
@@ -107,7 +106,7 @@ private struct NodeRow: View {
                     .font(Theme.caps(8))
                     .tracking(1.6)
                     .textCase(.uppercase)
-                    .foregroundStyle(Theme.accent.opacity(0.85))
+                    .foregroundStyle(Theme.folder.opacity(0.9))
                     .padding(.trailing, 4)
             }
         }
@@ -143,8 +142,10 @@ private struct NodeRow: View {
     }
 
     private var iconTint: Color {
-        if isCurrent { return Theme.accent }
-        return node.isDirectory ? Theme.accent.opacity(0.7) : Theme.textTertiary
+        if node.isDirectory {
+            return isCurrent ? Theme.folder : Theme.folder.opacity(0.8)
+        }
+        return isCurrent ? Theme.textPrimary : Theme.textTertiary
     }
 
     private var textColor: Color {
@@ -156,7 +157,7 @@ private struct NodeRow: View {
     @ViewBuilder
     private var rowBackground: some View {
         if isCurrent {
-            Theme.accentWash
+            Theme.folderWash
         } else if isSelected {
             Theme.panelRaised
         } else {

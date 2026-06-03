@@ -39,6 +39,14 @@ enum Theme {
     /// Faint accent wash (selection backgrounds).
     static let accentWash = Color(red: 0.852, green: 0.612, blue: 0.232, opacity: 0.13)
 
+    /// Folder color — sky blue, matches macOS Finder and the in-scene blue
+    /// pedestals so the folder icons read consistently across the sidebar,
+    /// HUD, and 3D view.
+    static let folder = Color(red: 0.28, green: 0.62, blue: 0.88)
+
+    /// Faint folder wash for the sidebar's "current folder" row background.
+    static let folderWash = Color(red: 0.28, green: 0.62, blue: 0.88, opacity: 0.15)
+
     // MARK: - Type
 
     /// Display serif. Apple's New York at large sizes feels editorial.

@@ -2,11 +2,26 @@ import Foundation
 import SceneKit
 import AppKit
 
+/// Coloring strategy for file slabs in the 3D scene.
+enum ColorMode: String, CaseIterable {
+    /// FSN-style heatmap by modification recency.
+    case age
+    /// Categorical palette by file kind (code / image / audio / …).
+    case type
+}
+
 enum SceneBuilder {
 
-    // Cell sizing for the unified grid (each grid cell holds either a file or a subdir-island)
+    /// Color strategy used by the next `makeLevelNode(root:)`. The Coordinator
+    /// sets this just before rebuilding so the chosen mode flows into every slab.
+    static var colorMode: ColorMode = .age
+
+    // Cell sizing for the unified grid (each grid cell holds either a file or a subdir-island).
+    // Spacing is ~110% of cell size so each item has FSN-style breathing room —
+    // the selection halo's bright ring forms on the floor outside the item and
+    // fades out before reaching the next cell.
     static let cellSize: CGFloat = 2.2
-    static let cellSpacing: CGFloat = 0.75
+    static let cellSpacing: CGFloat = 2.4
     static let fileBaseWidth: CGFloat = 1.4
     static let subdirPlatformHeight: CGFloat = 0.20
 
@@ -30,14 +45,25 @@ enum SceneBuilder {
     /// the folder's items laid out on top. The node is centered at its own origin
     /// (the floor's top surface is at local y = 0); the caller positions it in the
     /// stack. Returns the node and the grid's half-extent for camera framing.
-    static func makeLevelNode(root: FileSystemNode) -> (node: SCNNode, halfExtent: CGFloat) {
+    static func makeLevelNode(
+        root: FileSystemNode,
+        parentURL: URL? = nil
+    ) -> (node: SCNNode, halfExtent: CGFloat) {
         let level = SCNNode()
         level.name = "level"
 
-        struct Item { let node: FileSystemNode; let isSubdir: Bool }
-        let items: [Item] =
-            root.subdirectories.map { Item(node: $0, isSubdir: true) }
-            + root.files.map { Item(node: $0, isSubdir: false) }
+        // Items: optional back-up tile first, then subdirs, then files.
+        enum ItemKind {
+            case back(URL)
+            case subdir(FileSystemNode)
+            case file(FileSystemNode)
+        }
+        var items: [ItemKind] = []
+        if let parentURL {
+            items.append(.back(parentURL))
+        }
+        items += root.subdirectories.map { .subdir($0) }
+        items += root.files.map { .file($0) }
 
         let cols = max(1, Int(ceil(sqrt(Double(max(items.count, 1))))))
         let rows = max(1, Int(ceil(Double(max(items.count, 1)) / Double(cols))))
@@ -53,14 +79,90 @@ enum SceneBuilder {
             let row = i / cols
             let x = originX + CGFloat(col) * step
             let z = originZ + CGFloat(row) * step
-            let view: SCNNode = item.isSubdir
-                ? makeSubdirNode(subdir: item.node)
-                : makeFileNode(file: item.node, baseWidth: fileBaseWidth, maxHeight: fileMaxHeight)
+            let view: SCNNode
+            switch item {
+            case .back(let url):
+                view = makeBackNode(parentURL: url)
+            case .subdir(let n):
+                view = makeSubdirNode(subdir: n)
+            case .file(let n):
+                view = makeFileNode(file: n, baseWidth: fileBaseWidth, maxHeight: fileMaxHeight)
+            }
             view.position = SCNVector3(x, view.position.y, z)
             level.addChildNode(view)
         }
 
+        // Empty-folder message, centered on the floor when there are no real
+        // children. The back tile (if present) is unaffected — it sits at the
+        // first grid cell and the message floats above the otherwise-empty floor.
+        if root.children.isEmpty {
+            let label = makeFlatLabel(
+                text: "no files found",
+                accent: true,
+                maxWorldWidth: cellSize * 3
+            )
+            label.position = SCNVector3(0, 0.012, 0)
+            level.addChildNode(label)
+        }
+
         return (level, halfExtent)
+    }
+
+    // MARK: - Back-up navigation tile
+
+    /// A flat slab that, when clicked, navigates one level up the tree. Stored
+    /// `fsURL` is the parent folder's path; the click handler in SceneHostView
+    /// dispatches on the `navup` node name.
+    private static func makeBackNode(parentURL: URL) -> SCNNode {
+        let height = fileMaxHeight * 0.6
+        let baseWidth = fileBaseWidth
+
+        let geom = SCNBox(width: baseWidth, height: height, length: baseWidth, chamferRadius: 0.03)
+        let mat = SCNMaterial()
+        mat.lightingModel = .physicallyBased
+        // Warm amber so it stands apart from blue folders and FileKind file colors.
+        mat.diffuse.contents = NSColor(calibratedRed: 0.78, green: 0.58, blue: 0.22, alpha: 1)
+        mat.metalness.contents = 0.10
+        mat.roughness.contents = 0.55
+        geom.firstMaterial = mat
+
+        let node = SCNNode(geometry: geom)
+        node.position = SCNVector3(0, height / 2, 0)
+        node.name = "navup"
+        node.setValue(parentURL.path, forKey: "fsURL")
+        node.castsShadow = true
+
+        // Up-arrow icon at the back half, label at the front (matches the
+        // labeled-file layout so the slab reads as part of the level grid).
+        let topY = height / 2 + 0.012
+        if let icon = makeBackIconNode(width: baseWidth * 0.5) {
+            icon.position = SCNVector3(0, topY, -(fileCapHeight / 2 + 0.02))
+            node.addChildNode(icon)
+        }
+        let label = makeFlatLabel(text: "back", accent: false, maxWorldWidth: baseWidth * 0.92)
+        label.position = SCNVector3(0, topY, baseWidth / 2 - fileCapHeight / 2 - 0.04)
+        node.addChildNode(label)
+
+        return node
+    }
+
+    private static func makeBackIconNode(width: CGFloat) -> SCNNode? {
+        guard let image = renderSFSymbol("arrow.up.backward", tint: NSColor(calibratedWhite: 0.99, alpha: 1)) else {
+            return nil
+        }
+        let plane = SCNPlane(width: width, height: width)
+        let mat = SCNMaterial()
+        mat.diffuse.contents = image
+        mat.lightingModel = .constant
+        mat.isDoubleSided = true
+        mat.transparencyMode = .aOne
+        mat.writesToDepthBuffer = true
+        plane.firstMaterial = mat
+
+        let node = SCNNode(geometry: plane)
+        node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
+        node.name = "icon"
+        return node
     }
 
     // MARK: - Floor
@@ -88,7 +190,7 @@ enum SceneBuilder {
     /// so hover/click highlight works directly on its material. An icon plane sits on top.
     private static func makeFileNode(file: FileSystemNode, baseWidth: CGFloat, maxHeight: CGFloat) -> SCNNode {
         let height = slabHeight(forSize: file.size, max: maxHeight)
-        let color = colorForAge(modified: file.modificationDate)
+        let color = colorForFile(file)
 
         let geom = SCNBox(width: baseWidth, height: height, length: baseWidth, chamferRadius: 0.03)
         let mat = SCNMaterial()
@@ -102,6 +204,10 @@ enum SceneBuilder {
         node.position = SCNVector3(0, height / 2, 0)
         node.name = "file"
         node.setValue(file.url.path, forKey: "fsURL")
+        // Stash the file's name + modification date on the node so the scene can
+        // recolor slabs in place when the color mode is toggled (no rescan).
+        node.setValue(file.name, forKey: "fsName")
+        node.setValue(file.modificationDate as NSDate?, forKey: "fsModDate")
         node.castsShadow = true
 
         // Full-size (root-level) files carry a name label on the slab's top surface,
@@ -138,7 +244,9 @@ enum SceneBuilder {
         let geom = SCNBox(width: platformWidth, height: platformHeight, length: platformWidth, chamferRadius: 0.04)
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
-        mat.diffuse.contents = NSColor(calibratedRed: 0.78, green: 0.58, blue: 0.22, alpha: 1)
+        // macOS Finder folder sky-blue; contrasts cleanly with the warm selection
+        // spotlight (which clashed with the previous gold).
+        mat.diffuse.contents = NSColor(calibratedRed: 0.28, green: 0.62, blue: 0.88, alpha: 1)
         mat.metalness.contents = 0.10
         mat.roughness.contents = 0.55
         geom.firstMaterial = mat
@@ -168,7 +276,9 @@ enum SceneBuilder {
             let usableZ = platformWidth * 0.86 - labelStrip   // leave the front strip clear
             let stepX = usableX / CGFloat(cols)
             let stepZ = usableZ / CGFloat(max(rows, 1))
-            let miniBase = min(stepX, stepZ) * 0.78
+            // Tighter mini items (55% of step instead of 78%) so the selection
+            // halo on one mini-file doesn't bleed onto its neighbors.
+            let miniBase = min(stepX, stepZ) * 0.55
             let originX = -CGFloat(cols - 1) * stepX / 2
             // Center the item block in the back region (shifted toward -Z by half the strip).
             let originZ = -labelStrip / 2 - CGFloat(rows - 1) * stepZ / 2
@@ -208,7 +318,9 @@ enum SceneBuilder {
         let box = SCNBox(width: size, height: h, length: size, chamferRadius: 0.02)
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
-        mat.diffuse.contents = NSColor(calibratedRed: 0.86, green: 0.66, blue: 0.28, alpha: 1)
+        // Slightly brighter sibling of the main folder color (visual hierarchy:
+        // nested mini tiles read as "lighter" than their parent platform).
+        mat.diffuse.contents = NSColor(calibratedRed: 0.40, green: 0.70, blue: 0.92, alpha: 1)
         mat.metalness.contents = 0.10
         mat.roughness.contents = 0.55
         box.firstMaterial = mat
@@ -247,44 +359,9 @@ enum SceneBuilder {
 
     // MARK: - File-type icon plane
 
-    /// Map file extension to an SF Symbol. Generic catch-all is `doc`.
-    private static func iconName(for file: FileSystemNode) -> String {
-        let ext = (file.name as NSString).pathExtension.lowercased()
-        switch ext {
-        case "swift", "m", "h", "c", "cpp", "cc", "rs", "go", "py", "js", "ts", "rb", "java", "kt", "lua":
-            return "curlybraces"
-        case "png", "jpg", "jpeg", "gif", "heic", "tiff", "webp", "bmp":
-            return "photo"
-        case "mp3", "wav", "aiff", "flac", "m4a", "ogg", "opus":
-            return "waveform"
-        case "mp4", "mov", "mkv", "avi", "webm", "m4v":
-            return "film"
-        case "pdf":
-            return "doc.richtext"
-        case "doc", "docx", "txt", "md", "rtf", "tex":
-            return "doc.text"
-        case "zip", "tar", "gz", "bz2", "7z", "rar":
-            return "archivebox"
-        case "dmg", "iso", "img":
-            return "opticaldiscdrive"
-        case "json", "xml", "yaml", "yml", "toml", "plist":
-            return "list.bullet.indent"
-        case "html", "htm", "css", "scss", "sass":
-            return "globe"
-        case "app":
-            return "macwindow"
-        case "sh", "bash", "zsh", "fish", "command":
-            return "terminal"
-        case "":
-            return file.name.hasPrefix(".") ? "gearshape" : "doc"
-        default:
-            return "doc"
-        }
-    }
-
     /// A flat, tinted SF Symbol plane (per file type) laid on top of a file slab.
     private static func makeFileIconNode(for file: FileSystemNode, width: CGFloat) -> SCNNode? {
-        let symbol = iconName(for: file)
+        let symbol = FileKind.classify(name: file.name, isDirectory: file.isDirectory).iconName
         guard let image = renderSFSymbol(symbol, tint: NSColor(calibratedWhite: 0.96, alpha: 1)) else {
             return nil
         }
@@ -466,6 +543,35 @@ enum SceneBuilder {
         let clamped = Swift.max(1, Double(size))
         let h = log10(clamped) * 0.05
         return CGFloat(Swift.min(Double(maxH), Swift.max(0.07, h)))
+    }
+
+    /// Dispatch to the active color strategy for this slab.
+    private static func colorForFile(_ file: FileSystemNode) -> NSColor {
+        switch colorMode {
+        case .age:
+            return colorForAge(modified: file.modificationDate)
+        case .type:
+            return FileKind.classify(name: file.name, isDirectory: file.isDirectory).sceneColor
+        }
+    }
+
+    /// Walk every "file" slab under `root` and reapply its diffuse color using the
+    /// currently-set `colorMode`. Folder platforms (gold) are not affected.
+    static func recolorFileSlabs(under root: SCNNode) {
+        root.enumerateChildNodes { node, _ in
+            guard node.name == "file",
+                  let mat = node.geometry?.firstMaterial,
+                  let name = node.value(forKey: "fsName") as? String else { return }
+            let modDate = node.value(forKey: "fsModDate") as? Date
+            let color: NSColor
+            switch colorMode {
+            case .age:
+                color = colorForAge(modified: modDate)
+            case .type:
+                color = FileKind.classify(name: name, isDirectory: false).sceneColor
+            }
+            mat.diffuse.contents = color
+        }
     }
 
     /// FSN-style age heatmap.

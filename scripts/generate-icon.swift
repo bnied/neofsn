@@ -2,15 +2,18 @@
 import AppKit
 import Foundation
 
-/// Render an icon at exact pixel dimensions (NOT points — `NSImage(size:)` is
-/// point-sized, which on Retina expands to 2× pixels and trips the asset compiler).
+/// Render the neofsn app icon: a macOS-blue folder with the wordmark's italic
+/// "n" centered on its body. Simple, immediately recognizable, no 3D scene.
+///
+/// Rendered at exact pixel dimensions into a 16-bit-per-channel bitmap so
+/// alpha edges and gradients don't quantize.
 func renderIcon(pixels: Int) -> NSBitmapImageRep {
     let size = CGFloat(pixels)
     let rep = NSBitmapImageRep(
         bitmapDataPlanes: nil,
         pixelsWide: pixels,
         pixelsHigh: pixels,
-        bitsPerSample: 8,
+        bitsPerSample: 16,
         samplesPerPixel: 4,
         hasAlpha: true,
         isPlanar: false,
@@ -22,24 +25,27 @@ func renderIcon(pixels: Int) -> NSBitmapImageRep {
 
     NSGraphicsContext.saveGraphicsState()
     defer { NSGraphicsContext.restoreGraphicsState() }
-    guard let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return rep }
-    NSGraphicsContext.current = ctx
+    guard let nsctx = NSGraphicsContext(bitmapImageRep: rep) else { return rep }
+    NSGraphicsContext.current = nsctx
+    let ctx = nsctx.cgContext
+    let cs = CGColorSpaceCreateDeviceRGB()
 
+    // macOS rounded-square mask.
     let rect = NSRect(x: 0, y: 0, width: size, height: size)
     let cornerRadius = size * 0.2237
-    let clip = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
-    clip.addClip()
+    NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius).addClip()
 
-    // Background — deep slate
+    // ─── Backdrop — deep slate ────────────────────────────────────────────
     NSColor(calibratedRed: 0.045, green: 0.055, blue: 0.075, alpha: 1).set()
     rect.fill()
 
-    // Top sheen
+    // Soft top-to-bottom sheen (carried over from the original icon).
     if let sheen = NSGradient(starting: NSColor.white.withAlphaComponent(0.06), ending: .clear) {
         sheen.draw(in: rect, angle: 270)
     }
 
-    // Faint grid — only at sizes large enough to read
+    // Faint grid (also from the original) — adds a "spatial" hint, only at
+    // sizes large enough to register as more than noise.
     if pixels >= 64 {
         NSColor.white.withAlphaComponent(0.04).set()
         let spacing = size / 12
@@ -59,8 +65,81 @@ func renderIcon(pixels: Int) -> NSBitmapImageRep {
         }
     }
 
-    // Italic serif "n" — Iowan Old Style for guaranteed glyph coverage
-    let fontSize = size * 0.66
+    // ─── Folder ──────────────────────────────────────────────────────────
+    //
+    // Two parts: a small tab on the upper-left, and a larger rounded body
+    // beneath that overlaps the tab's lower edge. Standard macOS folder
+    // silhouette.
+    let folderInset: CGFloat = size * 0.18
+    let bodyTop: CGFloat = size * 0.72
+    let bodyBottom: CGFloat = size * 0.18
+    let bodyLeft: CGFloat = folderInset
+    let bodyRight: CGFloat = size - folderInset
+    let bodyRadius: CGFloat = size * 0.06
+
+    let tabLeft: CGFloat = bodyLeft + size * 0.02
+    let tabRight: CGFloat = bodyLeft + (bodyRight - bodyLeft) * 0.42
+    let tabTop: CGFloat = size * 0.80
+    let tabBottom: CGFloat = bodyTop - size * 0.04   // slight overlap into the body
+    let tabRadius: CGFloat = size * 0.04
+
+    // Tab — drawn first so the body covers its bottom edge.
+    let tabRect = NSRect(x: tabLeft, y: tabBottom, width: tabRight - tabLeft, height: tabTop - tabBottom)
+    let tabPath = NSBezierPath(roundedRect: tabRect, xRadius: tabRadius, yRadius: tabRadius)
+    NSGraphicsContext.saveGraphicsState()
+    tabPath.addClip()
+    if let tabShading = CGGradient(
+        colorsSpace: cs,
+        colors: [
+            NSColor(calibratedRed: 0.22, green: 0.48, blue: 0.74, alpha: 1).cgColor,
+            NSColor(calibratedRed: 0.14, green: 0.34, blue: 0.58, alpha: 1).cgColor,
+        ] as CFArray,
+        locations: [0, 1]
+    ) {
+        ctx.drawLinearGradient(
+            tabShading,
+            start: NSPoint(x: 0, y: tabTop),
+            end: NSPoint(x: 0, y: tabBottom),
+            options: []
+        )
+    }
+    NSGraphicsContext.restoreGraphicsState()
+
+    // Body — Finder sky-blue with a soft top-to-bottom shading.
+    let bodyRect = NSRect(x: bodyLeft, y: bodyBottom, width: bodyRight - bodyLeft, height: bodyTop - bodyBottom)
+    let bodyPath = NSBezierPath(roundedRect: bodyRect, xRadius: bodyRadius, yRadius: bodyRadius)
+    NSGraphicsContext.saveGraphicsState()
+    bodyPath.addClip()
+    if let bodyShading = CGGradient(
+        colorsSpace: cs,
+        colors: [
+            NSColor(calibratedRed: 0.26, green: 0.52, blue: 0.78, alpha: 1).cgColor,
+            NSColor(calibratedRed: 0.16, green: 0.38, blue: 0.62, alpha: 1).cgColor,
+        ] as CFArray,
+        locations: [0, 1]
+    ) {
+        ctx.drawLinearGradient(
+            bodyShading,
+            start: NSPoint(x: 0, y: bodyTop),
+            end: NSPoint(x: 0, y: bodyBottom),
+            options: []
+        )
+    }
+    NSGraphicsContext.restoreGraphicsState()
+
+    // Hairline highlight along the top edge of the body — subtle 3D lift.
+    NSGraphicsContext.saveGraphicsState()
+    bodyPath.addClip()
+    NSColor.white.withAlphaComponent(0.18).set()
+    let highlightRect = NSRect(x: bodyLeft, y: bodyTop - max(1, size / 512), width: bodyRight - bodyLeft, height: max(1, size / 512))
+    NSBezierPath(rect: highlightRect).fill()
+    NSGraphicsContext.restoreGraphicsState()
+
+    // ─── Italic "n" wordmark on the body ─────────────────────────────────
+    //
+    // Iowan Old Style Bold Italic — same font the original icon used and the
+    // app's display label uses. Amber so it pops against the blue body.
+    let fontSize = size * 0.46
     let font = NSFont(name: "IowanOldStyle-BoldItalic", size: fontSize)
         ?? NSFont(name: "IowanOldStyle-Italic", size: fontSize)
         ?? NSFont(name: "Iowan Old Style", size: fontSize)
@@ -72,32 +151,22 @@ func renderIcon(pixels: Int) -> NSBitmapImageRep {
     ]
     let glyph = "n" as NSString
     let glyphSize = glyph.size(withAttributes: attrs)
+    let bodyCenterX = (bodyLeft + bodyRight) / 2
+    let bodyCenterY = (bodyTop + bodyBottom) / 2
     let textRect = NSRect(
-        x: (size - glyphSize.width) / 2,
-        y: (size - glyphSize.height) / 2 - size * 0.05,
+        x: bodyCenterX - glyphSize.width / 2,
+        y: bodyCenterY - glyphSize.height / 2 - size * 0.03,
         width: glyphSize.width,
         height: glyphSize.height
     )
     glyph.draw(in: textRect, withAttributes: attrs)
 
-    // Small crosshair tick (top-right) — only on bigger sizes
-    if pixels >= 64 {
-        NSColor.white.withAlphaComponent(0.28).set()
-        let crossSize = size * 0.06
-        let cx = size * 0.83
-        let cy = size * 0.83
-        let cross = NSBezierPath()
-        cross.move(to: NSPoint(x: cx - crossSize / 2, y: cy))
-        cross.line(to: NSPoint(x: cx + crossSize / 2, y: cy))
-        cross.move(to: NSPoint(x: cx, y: cy - crossSize / 2))
-        cross.line(to: NSPoint(x: cx, y: cy + crossSize / 2))
-        cross.lineWidth = max(1, size / 256)
-        cross.stroke()
-    }
-
-    // Hairline inner border
+    // ─── Hairline inner border ───────────────────────────────────────────
     NSColor.white.withAlphaComponent(0.04).set()
-    let border = NSBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), xRadius: cornerRadius - 1, yRadius: cornerRadius - 1)
+    let border = NSBezierPath(
+        roundedRect: rect.insetBy(dx: 1, dy: 1),
+        xRadius: cornerRadius - 1, yRadius: cornerRadius - 1
+    )
     border.lineWidth = max(1, size / 512)
     border.stroke()
 
