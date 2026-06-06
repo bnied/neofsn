@@ -41,23 +41,58 @@ enum SceneBuilder {
     static var colorMode: ColorMode = .age
 
     // Cell sizing for the unified grid (each grid cell holds either a file or a subdir-island).
-    // Spacing is ~110% of cell size so each item has FSN-style breathing room —
-    // the selection halo's bright ring forms on the floor outside the item and
-    // fades out before reaching the next cell.
+    // `cellSpacing` is now the GAP between adjacent items, not "step − size", so a
+    // level with a 5.0-wide subdir platform and a 1.4-wide file slab still spaces
+    // them by the same readable gap. The selection halo is clamped to its cell
+    // step in `SceneHostView.coronaSize`, so the gap no longer needs to also act
+    // as a halo budget — it can stay tight.
     static let cellSize: CGFloat = 2.2
-    static let cellSpacing: CGFloat = 2.4
+    static let cellSpacing: CGFloat = 0.6
     static let fileBaseWidth: CGFloat = 1.4
     static let subdirPlatformHeight: CGFloat = 0.20
 
     // Block-height budgets (kept low so tall neighbors don't occlude labels).
-    static let fileMaxHeight: CGFloat = 0.30        // root-level file slabs
-    static let miniFileMaxHeight: CGFloat = 0.16    // files sitting on a subdir platform
-    static let miniSubdirHeight: CGFloat = 0.10     // nested sub-subdir tiles
+    static let fileMaxHeight: CGFloat = 0.18        // root-level file slabs
+    static let miniFileMaxHeight: CGFloat = 0.10    // files sitting on a subdir platform
+    static let miniSubdirHeight: CGFloat = 0.07     // nested sub-subdir tiles
 
     // Width budget for a flat floor label inside a single cell.
     // Labels are physically constrained to this width (truncated with ellipsis)
     // so they can never overlap a neighboring cell's label.
     static var labelMaxWorldWidth: CGFloat { cellSize - 0.2 }
+
+    // Fraction of a subdir platform's footprint that the mini-grid uses (the
+    // rest is the platform's outer border, plus the front label strip in Z).
+    // Made `internal` so the focus-mode label sizing in SceneHostView can derive
+    // the same per-mini-cell step from the platform's actual width.
+    static let subdirUsableFactor: CGFloat = 0.92
+
+    // Target mini-item footprint. Platforms grow so that EVERY mini item lands
+    // at this width regardless of folder density — a 9-item folder and a 36-item
+    // folder show the same-size cubes, just on different-sized platforms. Past
+    // `subdirMaxPlatformWidth` we accept slight per-item shrinkage so an absurdly
+    // dense folder doesn't blow out the level grid.
+    private static let subdirMiniTarget: CGFloat = 0.45
+    private static let subdirMiniFraction: CGFloat = 0.65  // miniBase = step × this
+    private static let subdirMaxPlatformWidth: CGFloat = 5.0
+
+    /// Pick a subdir platform footprint sized to keep mini items at the uniform
+    /// `subdirMiniTarget` size, so files don't get crushed in dense folders and
+    /// the label slots between them stay wide enough to read.
+    static func subdirPlatformWidth(itemCount: Int) -> CGFloat {
+        let n = max(1, itemCount)
+        let cols = Int(ceil(sqrt(Double(n))))
+        let rows = Int(ceil(Double(n) / Double(cols)))
+        let labelStrip = accentCapHeight + 0.32
+        // Solve for the platform width that yields `step ≥ miniTarget / miniFraction`
+        // in BOTH axes. Z is the binding axis because it also pays for the label
+        // strip — `stepZ = (platform · usable − labelStrip) / rows`.
+        let stepNeeded = subdirMiniTarget / subdirMiniFraction
+        let neededX = CGFloat(cols) * stepNeeded / subdirUsableFactor
+        let neededZ = (CGFloat(rows) * stepNeeded + labelStrip) / subdirUsableFactor
+        let needed = max(neededX, neededZ)
+        return max(cellSize, min(subdirMaxPlatformWidth, needed))
+    }
 
     struct LayoutMetrics {
         let halfExtent: CGFloat
@@ -91,8 +126,24 @@ enum SceneBuilder {
 
         let cols = max(1, Int(ceil(sqrt(Double(max(items.count, 1))))))
         let rows = max(1, Int(ceil(Double(max(items.count, 1)) / Double(cols))))
-        let step = cellSize + cellSpacing
+        // Subdir platforms now grow with their item count to keep mini files at
+        // a uniform readable size — so the level's grid step has to grow with
+        // the LARGEST platform on this level, otherwise a dense folder's plate
+        // would slop into its neighbor. Files and the back tile are at most
+        // `fileBaseWidth` wide, so they never bind the step.
+        var maxPlatformWidth: CGFloat = fileBaseWidth
+        for item in items {
+            if case .subdir(let n) = item {
+                let w = subdirPlatformWidth(itemCount: n.subdirectories.count + n.files.count)
+                if w > maxPlatformWidth { maxPlatformWidth = w }
+            }
+        }
+        let step = maxPlatformWidth + cellSpacing
         let halfExtent = max(CGFloat(cols), CGFloat(rows)) * step / 2
+        // Expose the step on the level node so the selection-halo logic in
+        // SceneHostView can clamp the corona to one cell, preventing root-level
+        // halos from spilling onto neighboring items.
+        level.setValue(NSNumber(value: Double(step)), forKey: "gridStep")
 
         level.addChildNode(makeFloorPlate(halfExtent: halfExtent))
 
@@ -260,7 +311,8 @@ enum SceneBuilder {
     /// Subdirectory = a flat raised platform; mini file slabs AND mini subdir-platforms
     /// sit on top of it. The platform IS the named interactive node.
     private static func makeSubdirNode(subdir: FileSystemNode) -> SCNNode {
-        let platformWidth = cellSize
+        let itemCount = subdir.subdirectories.count + subdir.files.count
+        let platformWidth = subdirPlatformWidth(itemCount: itemCount)
         let platformHeight = subdirPlatformHeight
 
         let geom = SCNBox(width: platformWidth, height: platformHeight, length: platformWidth, chamferRadius: 0.04)
@@ -268,7 +320,7 @@ enum SceneBuilder {
         mat.lightingModel = .physicallyBased
         // macOS Finder folder sky-blue; contrasts cleanly with the warm selection
         // spotlight (which clashed with the previous gold).
-        mat.diffuse.contents = NSColor(calibratedRed: 0.28, green: 0.62, blue: 0.88, alpha: 1)
+        mat.diffuse.contents = NSColor(calibratedRed: 0.18, green: 0.19, blue: 0.22, alpha: 1)
         mat.metalness.contents = 0.10
         mat.roughness.contents = 0.55
         geom.firstMaterial = mat
@@ -283,7 +335,13 @@ enum SceneBuilder {
         // surface (not the floor in front), so neighboring blocks can never occlude
         // it. We reserve a strip of depth `labelStrip` at the front (+Z, toward the
         // default camera) for the label and push the mini-items into the back area.
-        let labelStrip = accentCapHeight + 0.06
+        //
+        // The padding behind the label has to account for the mini-cubes' forward
+        // silhouette: at the overview pitch (~32°), a 0.16-tall mini-file projects
+        // ~0.26 units toward camera in screen space, so a tight padding makes the
+        // front-row cubes visually crowd onto the folder label even when they
+        // don't intersect it in world space.
+        let labelStrip = accentCapHeight + 0.32
 
         // Mini items on top — subdirs first (back rows), then files (front rows).
         struct MiniItem { let fs: FileSystemNode; let isDir: Bool }
@@ -294,16 +352,21 @@ enum SceneBuilder {
         if !items.isEmpty {
             let cols = max(1, Int(ceil(sqrt(Double(items.count)))))
             let rows = Int(ceil(Double(items.count) / Double(cols)))
-            let usableX = platformWidth * 0.86
-            let usableZ = platformWidth * 0.86 - labelStrip   // leave the front strip clear
+            let usableX = platformWidth * subdirUsableFactor
+            let usableZ = platformWidth * subdirUsableFactor - labelStrip
             let stepX = usableX / CGFloat(cols)
             let stepZ = usableZ / CGFloat(max(rows, 1))
-            // Tighter mini items (55% of step instead of 78%) so the selection
-            // halo on one mini-file doesn't bleed onto its neighbors.
-            let miniBase = min(stepX, stepZ) * 0.55
+            // Mini items fill 65% of their step. The remaining gap is wide enough
+            // for the selection halo without bleed but tight enough that the cubes
+            // don't drown in dead space on a half-empty platform.
+            let miniBase = min(stepX, stepZ) * 0.65
             let originX = -CGFloat(cols - 1) * stepX / 2
             // Center the item block in the back region (shifted toward -Z by half the strip).
             let originZ = -labelStrip / 2 - CGFloat(rows - 1) * stepZ / 2
+
+            // Per-item label width: 95% of the mini-grid step so adjacent labels
+            // never touch.
+            let miniLabelMaxWidth = min(stepX, stepZ) * 0.95
 
             for (i, item) in items.enumerated() {
                 let col = i % cols
@@ -317,6 +380,17 @@ enum SceneBuilder {
                     originZ + CGFloat(row) * stepZ
                 )
                 node.addChildNode(mini)
+
+                // Label baked in (not added on focus). The user expectation is that
+                // file names are visible whenever the files are — so the label is
+                // part of the platform geometry, not a focus-mode add-on.
+                let miniLabel = makeContentLabel(text: item.fs.name, maxWorldWidth: miniLabelMaxWidth)
+                miniLabel.position = SCNVector3(
+                    mini.position.x,
+                    platformHeight / 2 + 0.012,
+                    mini.position.z + miniBase / 2 + 0.03
+                )
+                node.addChildNode(miniLabel)
             }
         }
 
@@ -342,7 +416,7 @@ enum SceneBuilder {
         mat.lightingModel = .physicallyBased
         // Slightly brighter sibling of the main folder color (visual hierarchy:
         // nested mini tiles read as "lighter" than their parent platform).
-        mat.diffuse.contents = NSColor(calibratedRed: 0.40, green: 0.70, blue: 0.92, alpha: 1)
+        mat.diffuse.contents = NSColor(calibratedRed: 0.28, green: 0.29, blue: 0.32, alpha: 1)
         mat.metalness.contents = 0.10
         mat.roughness.contents = 0.55
         box.firstMaterial = mat

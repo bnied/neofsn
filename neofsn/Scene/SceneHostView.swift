@@ -76,6 +76,8 @@ struct SceneHostView: NSViewRepresentable {
         private var spotlightNode: SCNNode?
         private var coronaNode: SCNNode?
         private var coneNode: SCNNode?
+        private var selectionRingNode: SCNNode?
+        private var selectionRingInner: SCNNode?
         private let coronaBaseSize: CGFloat = 4.0
         // Cone roughly 1.5× cell-pitch tall — clearly a beam from above, but not
         // so tall it visually projects across rows behind from a tilted camera.
@@ -113,6 +115,7 @@ struct SceneHostView: NSViewRepresentable {
             configureSelectionSpotlight()
             configureSelectionCorona()
             configureSelectionCone()
+            configureSelectionRing()
         }
 
         /// Install the three-point-ish lighting rig (warm key + cool fill + ambient).
@@ -237,9 +240,16 @@ struct SceneHostView: NSViewRepresentable {
 
         /// Single framing routine for everything (overviews, levels, subfolder focus).
         /// Always uses the same 32° pitch via `overviewDistanceHeight`, so the camera
-        /// angle never changes between navigations — only its position.
-        private func flyToFrame(center: SCNVector3, halfExtent: CGFloat, duration: TimeInterval = 0.6) {
-            let (distance, height) = overviewDistanceHeight(halfExtent: halfExtent)
+        /// angle never changes between navigations — only its position. Pass `tight`
+        /// for FSN-style close-in framing of a single selected item: the item should
+        /// fill the frame, not float in the middle of a level-sized overview.
+        private func flyToFrame(
+            center: SCNVector3,
+            halfExtent: CGFloat,
+            duration: TimeInterval = 0.6,
+            tight: Bool = false
+        ) {
+            let (distance, height) = overviewDistanceHeight(halfExtent: halfExtent, tight: tight)
             flyCamera.flyToOverview(
                 of: center,
                 distance: distance,
@@ -285,35 +295,20 @@ struct SceneHostView: NSViewRepresentable {
         /// Fly into a subfolder platform without rebuilding (parent stays visible),
         /// and label its individual items so its contents become readable in place.
         func focusSubdir(_ platform: SCNNode) {
-            clearFocusLabels()
             focusedSubdir = platform
 
-            let platformHeight = (platform.geometry as? SCNBox)?.height ?? CGFloat(SceneBuilder.subdirPlatformHeight)
-            let topY = platformHeight / 2 + 0.012
+            let platformBox = platform.geometry as? SCNBox
+            let platformWidth = platformBox?.width ?? SceneBuilder.cellSize
 
-            for child in platform.childNodes {
-                guard let n = child.name, n == "file" || n == "pedestal:subdir",
-                      let payload = child.fsPayload else { continue }
-                let itemName = payload.name
-                let box = child.geometry as? SCNBox
-                let itemW = Double(box?.width ?? 0.5)
-                let itemHalfDepth = (box?.length ?? 0.5) / 2
-                let label = SceneBuilder.makeContentLabel(
-                    text: itemName,
-                    maxWorldWidth: CGFloat(max(itemW * 1.5, 0.55))
-                )
-                label.position = SCNVector3(
-                    child.position.x,
-                    topY,
-                    child.position.z + itemHalfDepth + 0.03
-                )
-                platform.addChildNode(label)
-                focusLabelNodes.append(label)
-            }
-
-            // Frame the focused platform at the SAME camera angle as every other view
-            // (no special close-up angle), just dollied in to the platform's footprint.
-            flyToFrame(center: platform.worldPosition, halfExtent: SceneBuilder.cellSize, duration: 0.55)
+            // Labels are baked into the platform itself (in SceneBuilder.makeSubdirNode)
+            // so this used to also add them on focus — that's redundant now. Just
+            // fly the camera.
+            flyToFrame(
+                center: platform.worldPosition,
+                halfExtent: platformWidth / 2,
+                duration: 0.55,
+                tight: true
+            )
         }
 
         private func clearFocusLabels() {
@@ -323,18 +318,28 @@ struct SceneHostView: NSViewRepresentable {
 
         // MARK: - Selection spotlight + corona (FSN-style warm pool of light on the selected item)
 
-        /// Persistent spot light parked off-stage at zero intensity. When something
-        /// is selected we animate its position over the item, size the cone to the
-        /// item's footprint, and ramp intensity up; deselection just fades it out.
+        /// Real SCNLight spot — illuminates the selected item and the surface
+        /// beneath it. The corona disc and volumetric cone are parked at opacity
+        /// 0 (and never animated up) so all the visible selection feedback comes
+        /// from this light. Intensity is tuned to read clearly without blowing
+        /// out the slab top — PBR material with roughness 0.55 gives a soft
+        /// diffuse glow rather than a hard specular hotspot at 600 lumens.
         private func configureSelectionSpotlight() {
             let node = SCNNode()
             let light = SCNLight()
             light.type = .spot
-            light.color = NSColor(calibratedRed: 1.0, green: 0.92, blue: 0.78, alpha: 1)
+            light.color = NSColor(calibratedRed: 1.0, green: 0.85, blue: 0.45, alpha: 1)
             light.intensity = 0
             light.attenuationStartDistance = 1.5
             light.attenuationEndDistance = 14
-            light.castsShadow = false
+            // Soft shadow so the plate occludes its own beam on the floor — the
+            // visible "ring of light" past the plate edge is the light spilling
+            // around the plate, not a texture.
+            light.castsShadow = true
+            light.shadowRadius = 8
+            light.shadowSampleCount = 16
+            light.shadowMode = .deferred
+            light.shadowColor = NSColor(calibratedWhite: 0, alpha: 0.5)
             node.light = light
             node.name = "selectionSpotlight"
             // Aim straight down (-Y). Only position + cone angles change at runtime.
@@ -414,6 +419,141 @@ struct SceneHostView: NSViewRepresentable {
             coneNode = node
         }
 
+        /// A flat warm-gold torus that lies on the surface around the selected
+        /// item. Replaces the spot-light / corona approach: the ring is geometry,
+        /// not light, so it scales cleanly with the item and never blows out the
+        /// slab's material or bleeds onto neighbors. Geometry is rebuilt on each
+        /// selection (cheap — one SCNTorus alloc) so the ring fits the item.
+        private func configureSelectionRing() {
+            // Soft halo as a textured flat plane (not extruded geometry). The
+            // texture has the ring drawn with multiple alpha-decreasing strokes,
+            // so the visible edges are diffuse — no hard geometric edges.
+            // Additive blend on a constant material makes it read as light.
+            let plane = SCNPlane(width: 1.0, height: 1.0)
+            let mat = SCNMaterial()
+            mat.lightingModel = .constant
+            mat.diffuse.contents = Self.selectionRingTexture
+            mat.transparencyMode = .aOne
+            mat.blendMode = .add
+            mat.isDoubleSided = true
+            mat.writesToDepthBuffer = false
+            mat.readsFromDepthBuffer = true
+            mat.diffuse.minificationFilter = .linear
+            mat.diffuse.magnificationFilter = .linear
+            mat.diffuse.mipFilter = .linear
+            mat.diffuse.wrapS = .clamp
+            mat.diffuse.wrapT = .clamp
+            plane.firstMaterial = mat
+
+            let wrapper = SCNNode()
+            wrapper.opacity = 0
+            wrapper.renderingOrder = 6
+            wrapper.castsShadow = false
+            wrapper.name = "selectionRing"
+
+            let inner = SCNNode(geometry: plane)
+            // SCNPlane is in the XY plane by default (vertical, facing +Z).
+            // Rotate -π/2 around X to lay it flat in the XZ plane facing +Y.
+            inner.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
+            inner.castsShadow = false
+            inner.name = "selectionRingInner"
+            wrapper.addChildNode(inner)
+
+            scene.rootNode.addChildNode(wrapper)
+            selectionRingNode = wrapper
+            selectionRingInner = inner
+
+            // Scale pulse only — no tilt animation. The X-tilt was rotating the
+            // flat halo so its front edge dipped under the plate's surface.
+            let pulse = SCNAction.sequence([
+                SCNAction.scale(to: 1.05, duration: 0.9),
+                SCNAction.scale(to: 1.00, duration: 0.9),
+            ])
+            pulse.timingMode = .easeInEaseOut
+            inner.runAction(SCNAction.repeatForever(pulse))
+        }
+
+        /// Pre-rendered soft halo texture: a single sharp rounded-rect stroke
+        /// passed through Core Image's `CIGaussianBlur` so the falloff is a
+        /// continuous Gaussian rather than the visibly-banded multi-stroke
+        /// stack we had before.
+        private static let selectionRingTexture: NSImage = {
+            let pixels = 512
+            let size = CGFloat(pixels)
+            let bitmap: (rep: NSBitmapImageRep, nsctx: NSGraphicsContext) = {
+                let rep = NSBitmapImageRep(
+                    bitmapDataPlanes: nil,
+                    pixelsWide: pixels, pixelsHigh: pixels,
+                    bitsPerSample: 16, samplesPerPixel: 4,
+                    hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB,
+                    bytesPerRow: 0, bitsPerPixel: 0
+                )!
+                let ctx = NSGraphicsContext(bitmapImageRep: rep)!
+                rep.size = NSSize(width: size, height: size)
+                return (rep, ctx)
+            }()
+
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = bitmap.nsctx
+            let ctx = bitmap.nsctx.cgContext
+
+            // Ring center at 70% of the texture half-extent. The blur expands
+            // outward from this stroke; the remaining 30% is the falloff room.
+            let ringHalf = size * 0.5 * 0.70
+            let center = CGPoint(x: size / 2, y: size / 2)
+            let cornerRadius: CGFloat = size * 0.03
+            let ringRect = CGRect(
+                x: center.x - ringHalf,
+                y: center.y - ringHalf,
+                width: ringHalf * 2, height: ringHalf * 2
+            )
+            let path = CGPath(
+                roundedRect: ringRect,
+                cornerWidth: cornerRadius, cornerHeight: cornerRadius,
+                transform: nil
+            )
+
+            let baseColor = NSColor(calibratedRed: 1.0, green: 0.80, blue: 0.32, alpha: 1.0)
+            ctx.setStrokeColor(baseColor.cgColor)
+            ctx.setLineWidth(8)
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            ctx.addPath(path)
+            ctx.strokePath()
+            NSGraphicsContext.restoreGraphicsState()
+
+            // Blur — single Gaussian pass gives a perfectly smooth falloff.
+            guard let sharpCG = bitmap.rep.cgImage else {
+                let image = NSImage(size: NSSize(width: size, height: size))
+                image.addRepresentation(bitmap.rep)
+                return image
+            }
+            let sharpCI = CIImage(cgImage: sharpCG)
+            let blur = CIFilter(name: "CIGaussianBlur")!
+            blur.setValue(sharpCI, forKey: kCIInputImageKey)
+            // 22 px σ — wide enough to read as a soft halo, tight enough that
+            // the outer falloff doesn't bleed into adjacent mini-item labels
+            // (which sit ~0.03 world units in front of each mini slab).
+            blur.setValue(22.0, forKey: kCIInputRadiusKey)
+
+            let extent = CGRect(x: 0, y: 0, width: size, height: size)
+            let ciCtx = CIContext()
+            guard
+                let outputCI = blur.outputImage?.cropped(to: extent),
+                let outputCG = ciCtx.createCGImage(outputCI, from: extent)
+            else {
+                let image = NSImage(size: NSSize(width: size, height: size))
+                image.addRepresentation(bitmap.rep)
+                return image
+            }
+
+            let blurredRep = NSBitmapImageRep(cgImage: outputCG)
+            let image = NSImage(size: NSSize(width: size, height: size))
+            image.addRepresentation(blurredRep)
+            return image
+        }()
+
         func handleSelectionChange() {
             let path = viewModel.selectedURL?.path
             if path == lastSelectedPath { return }
@@ -429,43 +569,89 @@ struct SceneHostView: NSViewRepresentable {
             moveSpotlight(to: node)
         }
 
-        /// Position the spotlight + corona + cone over `target`, sizing the cone so
-        /// its bright inner pool covers the whole item and the outer pool fades just
-        /// beyond its edges.
+        /// Position the selection ring around `target`. The spot light, corona,
+        /// and volumetric cone all stay parked at zero — the ring is the entire
+        /// selection feedback now.
         private func moveSpotlight(to target: SCNNode) {
-            guard let spot = spotlightNode, let light = spot.light else { return }
+            guard let wrapper = selectionRingNode, let inner = selectionRingInner else { return }
             let world = target.worldPosition
             let halfH = boxHeight(target) / 2
             let itemBaseY = world.y - halfH
-            let lightY = world.y + liftHeight
-            // No min clamp — tiny mini-files on packed pedestals deserve tiny
-            // halos, not 2.4-wide pools that drown their neighbors.
-            let half = footprint(target) * 0.5
-            // Cone's outer radius matches the corona's outer extent (= half × 2.4)
-            // so the volumetric cone tapers down to the same circle of light on
-            // the floor — the two effects read as a single coherent spotlight.
-            let outerRadius = half * 2.4
-            // Spot's outer cone reaches `outerRadius` at the item's BASE (= floor
-            // for root items, parent platform top for nested items). That way the
-            // visible cone matches the actual lit pool, and the cone bottom sits
-            // on the same surface the item rests on.
-            let outerDeg = atan(outerRadius / (lightY - itemBaseY)) * 180 / .pi
-            let innerDeg = outerDeg * 0.55
+            let f = footprint(target)
+            // Ring center sits AT the slab edge (no outward offset). The blurred
+            // halo's outer falloff naturally extends slightly past the edge for
+            // the visible glow; pushing the ring further out would make the
+            // glow reach into the mini-item labels in front.
+            let outerHalf = f * 0.5
+            let planeWidth = outerHalf * 2.0 / 0.70
+            // Flat plane — no thickness — just lift above the surface enough to
+            // avoid z-fight, no animation that could push it under.
+            let baseY = itemBaseY + 0.02
+
+            let plane = SCNPlane(width: planeWidth, height: planeWidth)
+            plane.firstMaterial = inner.geometry?.firstMaterial
 
             SCNTransaction.begin()
             SCNTransaction.animationDuration = 0.28
             SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
-            spot.position = SCNVector3(world.x, lightY, world.z)
-            light.spotInnerAngle = innerDeg
-            light.spotOuterAngle = outerDeg
-            // Intensity 0: the actual SCN light is off (it was the source of the
-            // specular hotspot on the icon). All visible feedback comes from the
-            // slab's emission glow, the visible cone, and the corona.
-            light.intensity = 0
+            inner.geometry = plane
+            wrapper.position = SCNVector3(world.x, baseY, world.z)
+            wrapper.opacity = 0.95
             SCNTransaction.commit()
+        }
 
-            moveCorona(to: target)
-            moveCone(to: target, bottomRadius: outerRadius, itemBaseY: itemBaseY, lightY: lightY)
+        /// Build a flat square-frame shape sized by `outerHalf` (half-side of
+        /// the outer rounded rect) with the given wall thickness and corner
+        /// radius. Path uses even-odd winding so the inner rect punches a hole.
+        private static func makeSelectionRingShape(
+            outerHalf: CGFloat, wallThickness: CGFloat, cornerRadius: CGFloat
+        ) -> SCNShape {
+            let innerHalf = max(0.001, outerHalf - wallThickness)
+            let outerCorner = min(cornerRadius, outerHalf * 0.5)
+            let innerCorner = max(0, outerCorner - wallThickness * 0.5)
+
+            let path = NSBezierPath()
+            path.appendRoundedRect(
+                NSRect(x: -outerHalf, y: -outerHalf, width: outerHalf * 2, height: outerHalf * 2),
+                xRadius: outerCorner, yRadius: outerCorner
+            )
+            path.appendRoundedRect(
+                NSRect(x: -innerHalf, y: -innerHalf, width: innerHalf * 2, height: innerHalf * 2),
+                xRadius: innerCorner, yRadius: innerCorner
+            )
+            path.windingRule = .evenOdd
+
+            let shape = SCNShape(path: path, extrusionDepth: wallThickness)
+            // Modest curve smoothness — the path is mostly straight edges
+            // anyway, the corners are the only places that need any segments.
+            shape.chamferRadius = 0
+            return shape
+        }
+
+        /// Half the step (one cell) of the grid containing `target`. Used to
+        /// clamp the spot light's outer-cone radius so the pool can't reach a
+        /// neighbor. Mini items get their parent's mini-grid step; root items
+        /// get the level's `gridStep` (stashed on the level node by
+        /// `SceneBuilder.makeLevelNode`).
+        private func gridCellHalfExtent(for target: SCNNode) -> CGFloat {
+            if let parent = target.parent, parent.name == "pedestal:subdir",
+               let parentBox = parent.geometry as? SCNBox {
+                let siblings = parent.childNodes.filter {
+                    $0.name == "file" || $0.name == "pedestal:subdir"
+                }
+                let cols = max(1, Int(ceil(sqrt(Double(max(siblings.count, 1))))))
+                let step = parentBox.width * SceneBuilder.subdirUsableFactor / CGFloat(cols)
+                return step / 2 * 1.2
+            }
+            var n: SCNNode? = target
+            while let cur = n {
+                if cur.name == "level",
+                   let stepNum = cur.value(forKey: "gridStep") as? NSNumber {
+                    return CGFloat(stepNum.doubleValue) / 2 * 1.2
+                }
+                n = cur.parent
+            }
+            return .greatestFiniteMagnitude
         }
 
         /// Position the volumetric cone with its narrow apex at the spotlight
@@ -503,8 +689,14 @@ struct SceneHostView: NSViewRepresentable {
             let world = target.worldPosition
             // Sit just above the target's bottom face (= floor or platform top).
             let baseY = world.y - boxHeight(target) / 2 + 0.012
-            // Halo extent = footprint × 2.4 — no min clamp so mini items get
-            // proportionally small halos and don't drown their neighbors.
+            // Halo extent = footprint × 2.4. With this gradient (bright ring at
+            // 50% of the texture radius), the visible bright pool lands at world
+            // radius `footprint × 0.6` — exactly footprint/2 from the item edge,
+            // a clear halo around the slab. The cone bottom radius is set to
+            // `footprint / 2` in `moveSpotlight` so it lands on the item edge
+            // (no overhang past the plate) — i.e., the cone's bottom and the
+            // corona's bright ring are stacked: cone occupies the item, bright
+            // pool sits just outside it, they read as one effect.
             let extent = footprint(target) * 2.4
             let scale = extent / coronaBaseSize
 
@@ -517,11 +709,14 @@ struct SceneHostView: NSViewRepresentable {
             SCNTransaction.commit()
         }
 
-        /// Ramp the spotlight, corona, and visible cone to zero (parked).
+        /// Ramp the selection ring to zero (parked).
         private func hideSpotlight() {
             SCNTransaction.begin()
             SCNTransaction.animationDuration = 0.20
             SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeIn)
+            selectionRingNode?.opacity = 0
+            // Belt-and-suspenders: the spot/corona/cone never go above zero
+            // anymore, but keep clearing them in case something nudges them.
             spotlightNode?.light?.intensity = 0
             coronaNode?.opacity = 0
             coneNode?.opacity = 0
@@ -613,7 +808,12 @@ struct SceneHostView: NSViewRepresentable {
                 if node.name == "pedestal:subdir" {
                     enterSubdir(node, url: req.url)
                 } else {
-                    flyToFrame(center: node.worldPosition, halfExtent: 1.4, duration: 0.5)
+                    flyToFrame(
+                        center: node.worldPosition,
+                        halfExtent: SceneBuilder.fileBaseWidth / 2,
+                        duration: 0.5,
+                        tight: true
+                    )
                 }
                 return
             }
@@ -667,14 +867,22 @@ struct SceneHostView: NSViewRepresentable {
         /// and back the camera off until that sphere fits within the camera's
         /// narrower field-of-view axis. No matrix/clip-space conventions to get
         /// wrong, and it's guaranteed to contain the entire grid.
-        private func overviewDistanceHeight(halfExtent: CGFloat) -> (distance: Double, height: Double) {
+        private func overviewDistanceHeight(
+            halfExtent: CGFloat,
+            tight: Bool = false
+        ) -> (distance: Double, height: Double) {
             let pitch = 32.0 * .pi / 180.0
             let cosP = cos(pitch), sinP = sin(pitch)
 
             // Grid is (roughly) square in the XZ plane; the corner sits at
             // halfExtent·√2 from center. Add the tallest block + a little slack.
-            let ext = Double(max(halfExtent, 1.5))
-            let radius = sqrt(2.0) * ext + 1.0
+            // In `tight` (single-item focus) mode we skip the grid-size floor and
+            // shrink the slack — both exist to keep an entire grid in frame and
+            // they vastly over-fit a single 1.4-wide file slab, which is why a
+            // selection used to land ~8 units back instead of dollying in close.
+            let ext = tight ? Double(halfExtent) : Double(max(halfExtent, 1.5))
+            let slack = tight ? 0.2 : 1.0
+            let radius = sqrt(2.0) * ext + slack
 
             // Determine the binding (smaller) half-FOV from the camera + aspect.
             var halfFov = (55.0 * .pi / 180.0) / 2.0
@@ -695,8 +903,10 @@ struct SceneHostView: NSViewRepresentable {
             }
 
             // Straight-line camera distance so the sphere subtends the FOV exactly,
-            // plus margin so content isn't edge-to-edge.
-            let margin = 1.18
+            // plus margin so content isn't edge-to-edge. Tight mode fits the sphere
+            // exactly (margin 1.0) so the item is as large as it can be without
+            // clipping at the frame edges.
+            let margin = tight ? 1.0 : 1.18
             let L = (radius / sin(max(halfFov, 0.01))) * margin
 
             return (L * cosP, L * sinP)
@@ -799,9 +1009,15 @@ struct SceneHostView: NSViewRepresentable {
                 enterSubdir(target, url: url)
             } else {
                 // Single click on a file selects it and frames it with the camera
-                // (same angle as everything else).
+                // (same angle as everything else), dollied in close FSN-style so
+                // the slab fills the frame.
                 viewModel.select(url)
-                flyToFrame(center: target.worldPosition, halfExtent: 1.4, duration: 0.45)
+                flyToFrame(
+                    center: target.worldPosition,
+                    halfExtent: SceneBuilder.fileBaseWidth / 2,
+                    duration: 0.45,
+                    tight: true
+                )
             }
         }
 
