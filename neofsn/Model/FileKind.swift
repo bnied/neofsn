@@ -22,10 +22,11 @@ enum FileKind {
     static func classify(name: String, isDirectory: Bool) -> FileKind {
         if isDirectory { return .folder }
         let lower = name.lowercased()
+        // Hidden dotfiles win over their extension, including multi-part names like
+        // ".eslintrc.json" or ".env.local" whose pathExtension is non-empty.
+        if lower.hasPrefix(".") { return .hidden }
         let ext = (lower as NSString).pathExtension
-        if ext.isEmpty {
-            return lower.hasPrefix(".") ? .hidden : .other
-        }
+        if ext.isEmpty { return .other }
         switch ext {
         case "swift", "m", "h", "c", "cpp", "cc", "rs", "go", "py", "js", "ts",
              "tsx", "jsx", "rb", "java", "kt", "lua", "pl", "php", "r":
