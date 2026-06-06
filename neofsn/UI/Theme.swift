@@ -54,11 +54,6 @@ enum Theme {
         .system(size: size, weight: weight, design: .serif)
     }
 
-    /// Italic display, for hero/specimen labels.
-    static func displayItalic(_ size: CGFloat, weight: Font.Weight = .light) -> Font {
-        .system(size: size, weight: weight, design: .serif)
-    }
-
     /// Body in SF Pro at a chosen size.
     static func body(_ size: CGFloat = 13, weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight, design: .default)

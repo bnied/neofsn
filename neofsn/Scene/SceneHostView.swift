@@ -1,6 +1,7 @@
 import SwiftUI
 import SceneKit
 import AppKit
+import Quartz
 
 /// SwiftUI wrapper that hosts the SceneKit `SCNView` and bridges view-model state
 /// (current root, focus/reset requests, selection) into the 3D scene via its Coordinator.
@@ -42,6 +43,7 @@ struct SceneHostView: NSViewRepresentable {
         context.coordinator.handleFocusRequest()
         context.coordinator.handleResetRequest()
         context.coordinator.handleSelectionChange()
+        context.coordinator.handleQuickLookRequest()
     }
 
     /// Tear down event monitors and the camera loop when the view is removed.
@@ -68,6 +70,9 @@ struct SceneHostView: NSViewRepresentable {
         private var focusLabelNodes: [SCNNode] = []
         private var levels: [Level] = []
         private var lastSelectedPath: String?
+        private var lastQuickLookToken = 0
+        /// path → interactive node, rebuilt whenever the level stack changes.
+        private var nodeIndex: [String: SCNNode] = [:]
         private var spotlightNode: SCNNode?
         private var coronaNode: SCNNode?
         private var coneNode: SCNNode?
@@ -81,6 +86,7 @@ struct SceneHostView: NSViewRepresentable {
         private var hoveredNode: SCNNode?
         private var hoverSavedEmission: Any?
         private var keyMonitor: Any?
+        private var resignObserver: NSObjectProtocol?
 
         /// Build the scene, camera (HDR/bloom off to avoid blow-out), and fly controller.
         init(viewModel: BrowserViewModel) {
@@ -198,6 +204,8 @@ struct SceneHostView: NSViewRepresentable {
                 levels.removeAll()
                 pushLevel(root: root)
             }
+
+            rebuildNodeIndex()
         }
 
         private func pushLevel(root: FileSystemNode) {
@@ -259,6 +267,14 @@ struct SceneHostView: NSViewRepresentable {
             resetView()
         }
 
+        /// Toggle Quick Look when the view-model bumps its token. Routed through the
+        /// SCNView so AppKit's responder-chain control protocol drives the panel.
+        func handleQuickLookRequest() {
+            guard viewModel.quickLookToken != lastQuickLookToken else { return }
+            lastQuickLookToken = viewModel.quickLookToken
+            (scnView as? InteractiveSCNView)?.toggleQuickLook()
+        }
+
         /// Re-frame the deepest (current) level and clear any focused-subfolder labels.
         func resetView() {
             clearFocusLabels()
@@ -277,8 +293,8 @@ struct SceneHostView: NSViewRepresentable {
 
             for child in platform.childNodes {
                 guard let n = child.name, n == "file" || n == "pedestal:subdir",
-                      let path = child.value(forKey: "fsURL") as? String else { continue }
-                let itemName = (path as NSString).lastPathComponent
+                      let payload = child.fsPayload else { continue }
+                let itemName = payload.name
                 let box = child.geometry as? SCNBox
                 let itemW = Double(box?.width ?? 0.5)
                 let itemHalfDepth = (box?.length ?? 0.5) / 2
@@ -402,6 +418,9 @@ struct SceneHostView: NSViewRepresentable {
             let path = viewModel.selectedURL?.path
             if path == lastSelectedPath { return }
             lastSelectedPath = path
+            // Keep an open Quick Look panel in sync with the selection (closes it
+            // when nothing is actionable, rather than leaving a stale preview).
+            (scnView as? InteractiveSCNView)?.refreshQuickLookIfVisible()
             guard let path, let node = findNode(forPath: path),
                   node.name == "file" || node.name == "pedestal:subdir" else {
                 hideSpotlight()
@@ -625,14 +644,19 @@ struct SceneHostView: NSViewRepresentable {
         }
 
         private func findNode(forPath path: String) -> SCNNode? {
-            var result: SCNNode?
-            scene.rootNode.enumerateChildNodes { node, stop in
-                if let p = node.value(forKey: "fsURL") as? String, p == path {
-                    result = node
-                    stop.pointee = true
-                }
+            nodeIndex[path]
+        }
+
+        /// Rebuild the path → interactive-node index. One scene walk per navigation,
+        /// instead of a full enumeration on every selection / focus lookup.
+        private func rebuildNodeIndex() {
+            nodeIndex.removeAll(keepingCapacity: true)
+            scene.rootNode.enumerateChildNodes { node, _ in
+                guard let name = node.name,
+                      name == "file" || name == "pedestal:subdir" || name == "navup",
+                      let path = node.fsPayload?.url.path else { return }
+                nodeIndex[path] = node
             }
-            return result
         }
 
         // MARK: - Camera framing
@@ -688,19 +712,36 @@ struct SceneHostView: NSViewRepresentable {
                 guard let self else { return event }
                 return self.handleMonitoredEvent(event)
             }
+            // Clear held keys when our window loses key focus, so a key still held
+            // during Cmd-Tab / window-switch doesn't leave the camera drifting.
+            resignObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification, object: nil, queue: .main
+            ) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self, note.object as? NSWindow === self.scnView?.window else { return }
+                    self.flyCamera.releaseAllKeys()
+                }
+            }
         }
 
-        /// Remove the key/flags monitor.
+        /// Remove the key/flags monitor and resign observer.
         func uninstallEventMonitors() {
             if let m = keyMonitor {
                 NSEvent.removeMonitor(m)
                 keyMonitor = nil
+            }
+            if let o = resignObserver {
+                NotificationCenter.default.removeObserver(o)
+                resignObserver = nil
             }
         }
 
         /// Route a monitored key event to the fly camera; swallow it (return nil) if
         /// the camera consumed it, otherwise pass it through.
         private func handleMonitoredEvent(_ event: NSEvent) -> NSEvent? {
+            // Local monitors are app-wide; only handle events for THIS coordinator's
+            // window so multiple open windows don't drive each other's cameras.
+            guard let myWindow = scnView?.window, event.window === myWindow else { return event }
             switch event.type {
             case .keyDown:
                 if flyCamera.handleKeyDown(event) { return nil }
@@ -734,8 +775,7 @@ struct SceneHostView: NSViewRepresentable {
                 resetView()
                 return
             }
-            let path = target.value(forKey: "fsURL") as? String
-            let url = path.map { URL(fileURLWithPath: $0) }
+            let url = target.fsPayload?.url
 
             if target.name == "navup", let url {
                 // Back-up tile: any click → navigate to parent.
@@ -788,8 +828,7 @@ struct SceneHostView: NSViewRepresentable {
             ])
             let target = hits.lazy.compactMap { self.interactiveAncestor(of: $0.node) }.first
             setHover(target)
-            let path = target?.value(forKey: "fsURL") as? String
-            viewModel.hover(path.map { URL(fileURLWithPath: $0) })
+            viewModel.hover(target?.fsPayload?.url)
         }
 
         /// Forward a scroll delta to the fly camera (dolly).
@@ -966,5 +1005,58 @@ final class InteractiveSCNView: SCNView {
             userInfo: nil
         )
         addTrackingArea(area)
+    }
+
+    // MARK: - Quick Look (responder-chain controlled)
+
+    /// AppKit walks the responder chain when the Quick Look panel opens; advertise
+    /// that this view controls it, and hand off the data source via the documented
+    /// begin/end callbacks instead of poking the shared panel imperatively.
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = self
+        panel.delegate = self
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        if panel.dataSource === self { panel.dataSource = nil }
+        if panel.delegate === self { panel.delegate = nil }
+    }
+
+    /// Toggle the shared Quick Look panel. Becoming first responder first ensures
+    /// AppKit routes begin/endPreviewPanelControl back to this view.
+    func toggleQuickLook() {
+        guard coordinator?.viewModel.actionableURL != nil, let panel = QLPreviewPanel.shared() else { return }
+        window?.makeFirstResponder(self)
+        if QLPreviewPanel.sharedPreviewPanelExists() && panel.isVisible {
+            panel.orderOut(nil)
+        } else {
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    /// Reload an open panel after the selection changes, closing it when nothing is
+    /// actionable so it never lingers on a stale preview.
+    func refreshQuickLookIfVisible() {
+        guard QLPreviewPanel.sharedPreviewPanelExists(),
+              let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
+        if coordinator?.viewModel.actionableURL == nil {
+            panel.orderOut(nil)
+        } else {
+            panel.reloadData()
+        }
+    }
+}
+
+// MARK: - Quick Look data source
+
+extension InteractiveSCNView: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        coordinator?.viewModel.actionableURL == nil ? 0 : 1
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        coordinator?.viewModel.actionableURL as QLPreviewItem?
     }
 }

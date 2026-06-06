@@ -1,7 +1,6 @@
 import Foundation
 import SwiftUI
 import AppKit
-import Quartz
 
 @MainActor
 final class BrowserViewModel: ObservableObject {
@@ -34,6 +33,10 @@ final class BrowserViewModel: ObservableObject {
     @Published private(set) var resetViewToken: Int = 0
     func requestResetView() { resetViewToken += 1 }
 
+    /// Incremented to ask the 3D scene to toggle the Quick Look panel. The scene
+    /// coordinator owns the panel so it can drive it through the responder chain.
+    @Published private(set) var quickLookToken: Int = 0
+
     /// Active strategy for coloring file slabs in the 3D scene. Changing this
     /// bumps `colorRebuildToken` so the scene rebuilds with the new palette.
     @Published var colorMode: ColorMode = .age {
@@ -47,6 +50,12 @@ final class BrowserViewModel: ObservableObject {
     @Published private(set) var colorRebuildToken: Int = 0
 
     private var history: [URL] = []
+
+    /// Monotonic navigation counter. Each load captures the current value and, when
+    /// its scan finishes, commits results (and clears the spinner) only if it is
+    /// still the latest — so an earlier-but-slower scan can't clobber a newer
+    /// navigation, and overlapping scans don't drop the spinner early.
+    private var navGeneration = 0
 
     private let sidebarMaxDepth = 3
     private let sceneMaxDepth = 3
@@ -72,14 +81,15 @@ final class BrowserViewModel: ObservableObject {
 
     /// Make `url` the current 3D root (re-roots / pushes a layer). Pushed onto history.
     func descend(into url: URL) {
-        Task { await loadCurrent(url: url) }
+        Task { await loadCurrent(url: url, history: .push) }
     }
 
-    /// Navigate to an arbitrary folder (e.g. a breadcrumb segment). Same as descend;
-    /// the 3D scene interprets the transition (pop to it if it's an ancestor already
-    /// in the stack, otherwise re-layer).
+    /// Navigate to an arbitrary folder (e.g. a breadcrumb segment or the back-up
+    /// tile). If `url` is already in history (an ancestor we came through) the
+    /// forward entries are truncated; otherwise it's appended — so Back keeps meaning
+    /// "the previous folder" instead of growing the stack with duplicates.
     func navigate(to url: URL) {
-        Task { await loadCurrent(url: url) }
+        Task { await loadCurrent(url: url, history: .jump) }
     }
 
     /// The originally-opened folder — navigation is clamped at or below this, since
@@ -89,53 +99,82 @@ final class BrowserViewModel: ObservableObject {
     /// Step back to the previously-visited folder in history.
     func goBack() {
         guard history.count > 1 else { return }
-        history.removeLast()
-        let prev = history.removeLast()
-        Task { await loadCurrent(url: prev) }
+        // Target the entry before the current one; `.jump` truncates history to it.
+        let target = history[history.count - 2]
+        Task { await loadCurrent(url: target, history: .jump) }
     }
 
-    /// Re-scan and reload the current folder in place.
+    /// Re-scan and reload the current folder in place (history unchanged).
     func reload() {
         guard let url = currentURL else { return }
-        Task { await loadCurrent(url: url) }
+        Task { await loadCurrent(url: url, history: .keep) }
     }
 
     // MARK: - Loading
 
-    /// Load a freshly-opened folder: scan it both deeply (for the sidebar tree) and
-    /// shallowly (for the 3D scene), and reset history to this root.
+    /// How a successful load mutates the navigation history stack.
+    private enum NavHistory {
+        case push   // descend into a child → append
+        case jump   // breadcrumb / back / arbitrary → truncate to it if present, else append
+        case keep   // reload in place → leave history untouched
+    }
+
+    private func applyHistory(_ mode: NavHistory, url: URL) {
+        switch mode {
+        case .push:
+            history.append(url)
+        case .jump:
+            if let idx = history.lastIndex(of: url) {
+                history.removeSubrange((idx + 1)...)
+            } else {
+                history.append(url)
+            }
+        case .keep:
+            break
+        }
+    }
+
+    /// Load a freshly-opened folder and reset history to this root. The sidebar and
+    /// scene currently use the same scan depth, so a single scan serves both.
     private func loadInitial(url: URL) async {
+        navGeneration += 1
+        let generation = navGeneration
         isScanning = true
         lastError = nil
-        defer { isScanning = false }
         do {
-            async let sidebarTask = FileSystemScanner.scan(root: url, maxDepth: sidebarMaxDepth)
-            async let sceneTask = FileSystemScanner.scan(root: url, maxDepth: sceneMaxDepth)
-            let (sidebar, scene) = try await (sidebarTask, sceneTask)
-            sidebarRoot = sidebar
-            currentRoot = scene
+            let node = try await FileSystemScanner.scan(root: url, maxDepth: max(sidebarMaxDepth, sceneMaxDepth))
+            guard generation == navGeneration else { return }   // superseded
+            sidebarRoot = node
+            currentRoot = node
             history = [url]
             selectedURL = nil
             hoveredURL = nil
         } catch {
+            guard generation == navGeneration else { return }
             lastError = error.localizedDescription
         }
+        if generation == navGeneration { isScanning = false }
     }
 
-    /// Scan `url` shallowly and make it the current 3D root, appending to history.
-    private func loadCurrent(url: URL) async {
+    /// Scan `url` shallowly, make it the current 3D root, and update history per `mode`.
+    /// A generation guard ensures a slower earlier scan can't overwrite a newer one.
+    private func loadCurrent(url: URL, history mode: NavHistory) async {
+        navGeneration += 1
+        let generation = navGeneration
         isScanning = true
         lastError = nil
-        defer { isScanning = false }
         do {
             let node = try await FileSystemScanner.scan(root: url, maxDepth: sceneMaxDepth)
+            guard generation == navGeneration else { return }   // superseded by a newer navigation
             currentRoot = node
             selectedURL = nil
             hoveredURL = nil
-            history.append(url)
+            applyHistory(mode, url: url)
         } catch {
+            guard generation == navGeneration else { return }
             lastError = error.localizedDescription
         }
+        if generation == navGeneration { isScanning = false }
     }
 
     // MARK: - Sidebar interaction
@@ -202,9 +241,14 @@ final class BrowserViewModel: ObservableObject {
         pb.setString(url.path, forType: .string)
     }
 
-    /// Show (or update) the Quick Look panel for the actionable item.
+    /// Toggle the Quick Look panel for the actionable item (handled by the scene
+    /// coordinator via `quickLookToken`).
     func quickLook() {
-        guard let url = actionableURL else { return }
-        QuickLookPreview.shared.preview(url: url)
+        guard actionableURL != nil else { return }
+        // Deferred to the next run-loop tick so the publish doesn't happen
+        // inside a view update — `.onKeyPress(.space)` can dispatch its handler
+        // synchronously during layout, which would otherwise trip SwiftUI's
+        // "Publishing changes from within view updates" runtime warning.
+        Task { @MainActor in quickLookToken += 1 }
     }
 }

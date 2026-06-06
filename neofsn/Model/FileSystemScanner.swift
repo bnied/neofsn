@@ -37,21 +37,28 @@ enum FileSystemScanner {
         }
 
         var children: [FileSystemNode] = []
+        var isReadable = true
         if depth < maxDepth {
             let fm = FileManager.default
-            let entries = (try? fm.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: resourceKeys,
-                options: [.skipsHiddenFiles, .skipsPackageDescendants]
-            )) ?? []
-            for entry in entries {
-                if let child = try? scanSync(url: entry, depth: depth + 1, maxDepth: maxDepth) {
-                    children.append(child)
+            do {
+                let entries = try fm.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: resourceKeys,
+                    options: [.skipsHiddenFiles, .skipsPackageDescendants]
+                )
+                for entry in entries {
+                    if let child = try? scanSync(url: entry, depth: depth + 1, maxDepth: maxDepth) {
+                        children.append(child)
+                    }
                 }
-            }
-            children.sort { lhs, rhs in
-                if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory && !rhs.isDirectory }
-                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                children.sort { lhs, rhs in
+                    if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory && !rhs.isDirectory }
+                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                }
+            } catch {
+                // Directory exists but its contents can't be listed (e.g. permission
+                // denied) — surface that instead of rendering it as an empty folder.
+                isReadable = false
             }
         }
 
@@ -61,7 +68,8 @@ enum FileSystemScanner {
             isDirectory: true,
             size: 0,
             modificationDate: mtime,
-            children: children
+            children: children,
+            isReadable: isReadable
         )
     }
 }

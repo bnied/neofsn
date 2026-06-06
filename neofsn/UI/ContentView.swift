@@ -1,5 +1,4 @@
 import SwiftUI
-import Quartz
 
 struct ContentView: View {
 
@@ -66,15 +65,14 @@ struct ContentView: View {
                 }
             }
             .padding(.horizontal, 18)
-            .padding(.top, 30)
+            .padding(.top, 0)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
     /// Quick Look the actionable item (bound to the Space key).
     private func previewSelected() {
-        guard let url = viewModel.actionableURL else { return }
-        QuickLookPreview.shared.preview(url: url)
+        viewModel.quickLook()
     }
 }
 

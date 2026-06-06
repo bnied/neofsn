@@ -2,6 +2,30 @@ import Foundation
 import SceneKit
 import AppKit
 
+/// Typed identity attached to an interactive scene node (file slab, subdir
+/// platform, or back tile). Replaces loose string-keyed KVC values (`fsURL`,
+/// `fsName`, `fsModDate`) so a renamed key can't silently break lookups, and the
+/// URL is stored directly rather than round-tripped through a path string.
+final class NodePayload: NSObject {
+    let url: URL
+    let name: String
+    let modificationDate: Date?
+    init(url: URL, name: String, modificationDate: Date? = nil) {
+        self.url = url
+        self.name = name
+        self.modificationDate = modificationDate
+    }
+}
+
+extension SCNNode {
+    static let fsPayloadKey = "fsPayload"
+    /// Filesystem identity for interactive nodes; nil for decorative geometry.
+    var fsPayload: NodePayload? {
+        get { value(forKey: SCNNode.fsPayloadKey) as? NodePayload }
+        set { setValue(newValue, forKey: SCNNode.fsPayloadKey) }
+    }
+}
+
 /// Coloring strategy for file slabs in the 3D scene.
 enum ColorMode: String, CaseIterable {
     /// FSN-style heatmap by modification recency.
@@ -97,7 +121,7 @@ enum SceneBuilder {
         // first grid cell and the message floats above the otherwise-empty floor.
         if root.children.isEmpty {
             let label = makeFlatLabel(
-                text: "no files found",
+                text: root.isReadable ? "no files found" : "permission denied",
                 accent: true,
                 maxWorldWidth: cellSize * 3
             )
@@ -129,7 +153,7 @@ enum SceneBuilder {
         let node = SCNNode(geometry: geom)
         node.position = SCNVector3(0, height / 2, 0)
         node.name = "navup"
-        node.setValue(parentURL.path, forKey: "fsURL")
+        node.fsPayload = NodePayload(url: parentURL, name: parentURL.lastPathComponent)
         node.castsShadow = true
 
         // Up-arrow icon at the back half, label at the front (matches the
@@ -203,11 +227,9 @@ enum SceneBuilder {
         let node = SCNNode(geometry: geom)
         node.position = SCNVector3(0, height / 2, 0)
         node.name = "file"
-        node.setValue(file.url.path, forKey: "fsURL")
-        // Stash the file's name + modification date on the node so the scene can
+        // Carry the file's identity (url + name + mod date) so the scene can
         // recolor slabs in place when the color mode is toggled (no rescan).
-        node.setValue(file.name, forKey: "fsName")
-        node.setValue(file.modificationDate as NSDate?, forKey: "fsModDate")
+        node.fsPayload = NodePayload(url: file.url, name: file.name, modificationDate: file.modificationDate)
         node.castsShadow = true
 
         // Full-size (root-level) files carry a name label on the slab's top surface,
@@ -254,7 +276,7 @@ enum SceneBuilder {
         let node = SCNNode(geometry: geom)
         node.position = SCNVector3(0, platformHeight / 2, 0)
         node.name = "pedestal:subdir"
-        node.setValue(subdir.url.path, forKey: "fsURL")
+        node.fsPayload = NodePayload(url: subdir.url, name: subdir.name)
         node.castsShadow = true
 
         // The folder's name is rendered flat onto the front of the platform's TOP
@@ -328,7 +350,7 @@ enum SceneBuilder {
         let node = SCNNode(geometry: box)
         node.position = SCNVector3(0, h / 2, 0)
         node.name = "pedestal:subdir"
-        node.setValue(subdir.url.path, forKey: "fsURL")
+        node.fsPayload = NodePayload(url: subdir.url, name: subdir.name)
         node.castsShadow = true
 
         // A small folder icon centered on top so it reads as "a folder" rather than another file.
@@ -561,14 +583,13 @@ enum SceneBuilder {
         root.enumerateChildNodes { node, _ in
             guard node.name == "file",
                   let mat = node.geometry?.firstMaterial,
-                  let name = node.value(forKey: "fsName") as? String else { return }
-            let modDate = node.value(forKey: "fsModDate") as? Date
+                  let payload = node.fsPayload else { return }
             let color: NSColor
             switch colorMode {
             case .age:
-                color = colorForAge(modified: modDate)
+                color = colorForAge(modified: payload.modificationDate)
             case .type:
-                color = FileKind.classify(name: name, isDirectory: false).sceneColor
+                color = FileKind.classify(name: payload.name, isDirectory: false).sceneColor
             }
             mat.diffuse.contents = color
         }

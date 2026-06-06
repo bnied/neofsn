@@ -10,6 +10,9 @@ final class FileSystemNode: Identifiable, Hashable {
     let size: Int64
     let modificationDate: Date?
     var children: [FileSystemNode]
+    /// False if this directory existed but its contents couldn't be read (e.g.
+    /// permission denied), so the UI can distinguish "empty" from "unreadable".
+    let isReadable: Bool
 
     /// Create a node from already-scanned attributes.
     init(
@@ -18,7 +21,8 @@ final class FileSystemNode: Identifiable, Hashable {
         isDirectory: Bool,
         size: Int64,
         modificationDate: Date?,
-        children: [FileSystemNode] = []
+        children: [FileSystemNode] = [],
+        isReadable: Bool = true
     ) {
         self.url = url
         self.name = name
@@ -26,6 +30,7 @@ final class FileSystemNode: Identifiable, Hashable {
         self.size = size
         self.modificationDate = modificationDate
         self.children = children
+        self.isReadable = isReadable
     }
 
     /// Identity equality (each scanned node has a unique `id`).

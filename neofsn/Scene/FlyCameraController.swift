@@ -24,6 +24,10 @@ final class FlyCameraController {
     private var lastTick: CFTimeInterval = 0
     private var boost: Bool = false
 
+    /// Bumped whenever a framing flight starts or is cancelled, so a flight's
+    /// deferred completion only applies if it's still the active flight.
+    private var flightToken = 0
+
     /// Bind the controller to a camera node and apply the initial yaw/pitch.
     init(cameraNode: SCNNode, initialYaw: Double = 0, initialPitch: Double = -0.45) {
         self.cameraNode = cameraNode
@@ -57,6 +61,7 @@ final class FlyCameraController {
     /// Snap the camera back to its default position and orientation.
     func resetToDefault() {
         cameraNode.removeAllActions()
+        flightToken &+= 1
         yaw = 0
         pitch = -0.45
         velocity = .zero
@@ -64,10 +69,32 @@ final class FlyCameraController {
         applyOrientation()
     }
 
+    /// Cancel any in-flight framing animation and recover the camera's *live*
+    /// orientation into `yaw`/`pitch`. The fly animates the node directly while
+    /// `yaw`/`pitch` stay frozen at their pre-flight values, so without this an
+    /// interrupting look/scroll/move would snap the view back to a stale angle.
+    private func cancelFlight() {
+        let live = cameraNode.presentation.eulerAngles
+        cameraNode.removeAllActions()
+        flightToken &+= 1   // invalidate any pending flight completion
+        pitch = Double(live.x)
+        yaw = Double(live.y)
+    }
+
+    /// Clear all held movement input. Called when the window loses key focus so a
+    /// key still physically held during Cmd-Tab doesn't leave the camera drifting.
+    func releaseAllKeys() {
+        heldKeys.removeAll()
+        boost = false
+        velocity = .zero
+    }
+
     /// Animate the camera to look at `focus` from `distance` back and `height` up
     /// (absolute Y), facing along -Z. Used for all overview/level/focus framing.
     func flyToOverview(of focus: SCNVector3, distance: Double = 18, height: Double = 11, duration: TimeInterval = 0.6) {
         cameraNode.removeAllActions()
+        flightToken &+= 1
+        let token = flightToken
         velocity = .zero
         let target = SCNVector3(focus.x, CGFloat(height), focus.z + CGFloat(distance))
         let newYaw: Double = 0
@@ -89,8 +116,10 @@ final class FlyCameraController {
         rotate.timingMode = .easeInEaseOut
         cameraNode.runAction(.group([move, rotate])) { [weak self] in
             Task { @MainActor in
-                self?.yaw = newYaw
-                self?.pitch = newPitch
+                // Only sync state if this flight wasn't superseded or interrupted.
+                guard let self, self.flightToken == token else { return }
+                self.yaw = newYaw
+                self.pitch = newPitch
             }
         }
     }
@@ -104,6 +133,8 @@ final class FlyCameraController {
         boost = event.modifierFlags.contains(.shift)
         let code = event.keyCode
         if Self.movementKeyCodes.contains(code) {
+            // Movement keys take over from any in-flight framing animation.
+            if heldKeys.isEmpty { cancelFlight() }
             heldKeys.insert(code)
             return true
         }
@@ -123,9 +154,10 @@ final class FlyCameraController {
     }
 
     func handleMouseDrag(deltaX: CGFloat, deltaY: CGFloat) {
-        // Manual input is authoritative: cancel any in-flight focus animation so the
-        // direct transform write below isn't immediately overwritten by the action.
-        cameraNode.removeAllActions()
+        // Manual input is authoritative: cancel any in-flight focus animation and
+        // recover the live orientation so the look delta applies from where the
+        // camera actually is (not a stale pre-flight angle).
+        cancelFlight()
         yaw -= Double(deltaX) * lookSensitivity
         pitch -= Double(deltaY) * lookSensitivity
         pitch = max(-.pi / 2 + 0.05, min(.pi / 2 - 0.05, pitch))
@@ -133,8 +165,9 @@ final class FlyCameraController {
     }
 
     func handleScroll(deltaY: CGFloat) {
-        // Cancel any in-flight focus animation so the scroll takes over immediately.
-        cameraNode.removeAllActions()
+        // Cancel any in-flight focus animation (recovering live orientation) so the
+        // dolly takes over immediately and moves along the correct view direction.
+        cancelFlight()
         // Move forward/back along view direction
         let forward = forwardVector()
         let step = Double(deltaY) * scrollSpeed
