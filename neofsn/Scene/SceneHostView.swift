@@ -82,25 +82,13 @@ struct SceneHostView: NSViewRepresentable {
         private var lastFocusToken: Int = 0
         private var lastResetToken: Int = 0
         private var lastColorRebuildToken: Int = 0
-        private var lastHalfExtent: CGFloat = 8
-        private var focusLabelNodes: [SCNNode] = []
         private var levels: [Level] = []
         private var lastSelectedPath: String?
         private var lastQuickLookToken = 0
         /// path → interactive node, rebuilt whenever the level stack changes.
         private var nodeIndex: [String: SCNNode] = [:]
-        private var spotlightNode: SCNNode?
-        private var coronaNode: SCNNode?
-        private var coneNode: SCNNode?
         private var selectionRingNode: SCNNode?
         private var selectionRingInner: SCNNode?
-        private let coronaBaseSize: CGFloat = 4.0
-        // Cone roughly 1.5× cell-pitch tall — clearly a beam from above, but not
-        // so tall it visually projects across rows behind from a tilted camera.
-        private let liftHeight: CGFloat = 3.6
-        private let coneBaseHeight: CGFloat = 3.6
-        private let coneBaseTopRadius: CGFloat = 0.05
-        private let coneBaseBottomRadius: CGFloat = 1.0
         private var hoveredNode: SCNNode?
         private var hoverSavedEmission: Any?
         private var keyMonitor: Any?
@@ -128,9 +116,6 @@ struct SceneHostView: NSViewRepresentable {
             self.flyCamera = FlyCameraController(cameraNode: cameraNode)
             super.init()
             configureLights()
-            configureSelectionSpotlight()
-            configureSelectionCorona()
-            configureSelectionCone()
             configureSelectionRing()
         }
 
@@ -198,7 +183,6 @@ struct SceneHostView: NSViewRepresentable {
             lastRootID = root.id
             lastColorRebuildToken = viewModel.colorRebuildToken
             clearHover()
-            clearFocusLabels()
             hideSpotlight()
 
             // A color-mode swap with no navigation: walk every file slab in the
@@ -293,7 +277,6 @@ struct SceneHostView: NSViewRepresentable {
             scene.rootNode.addChildNode(node)
             let level = Level(url: root.url, node: node, center: center, halfExtent: halfExtent, hasBack: hasBack)
             levels.append(level)
-            lastHalfExtent = halfExtent
 
             // Cross-fade the new level in while the parent fades out, then hide the
             // parent so it's neither drawn nor hit-testable. It stays in the stack so
@@ -416,117 +399,10 @@ struct SceneHostView: NSViewRepresentable {
 
         /// Re-frame the deepest (current) level.
         func resetView() {
-            clearFocusLabels()
             if let level = levels.last { flyToLevel(level) }
         }
 
-        private func clearFocusLabels() {
-            focusLabelNodes.forEach { $0.removeFromParentNode() }
-            focusLabelNodes.removeAll()
-        }
-
-        // MARK: - Selection spotlight + corona (FSN-style warm pool of light on the selected item)
-
-        /// Real SCNLight spot — illuminates the selected item and the surface
-        /// beneath it. The corona disc and volumetric cone are parked at opacity
-        /// 0 (and never animated up) so all the visible selection feedback comes
-        /// from this light. Intensity is tuned to read clearly without blowing
-        /// out the slab top — PBR material with roughness 0.55 gives a soft
-        /// diffuse glow rather than a hard specular hotspot at 600 lumens.
-        private func configureSelectionSpotlight() {
-            let node = SCNNode()
-            let light = SCNLight()
-            light.type = .spot
-            light.color = NSColor(calibratedRed: 1.0, green: 0.85, blue: 0.45, alpha: 1)
-            light.intensity = 0
-            light.attenuationStartDistance = 1.5
-            light.attenuationEndDistance = 14
-            // Soft shadow so the plate occludes its own beam on the floor — the
-            // visible "ring of light" past the plate edge is the light spilling
-            // around the plate, not a texture.
-            light.castsShadow = true
-            light.shadowRadius = 8
-            light.shadowSampleCount = 16
-            light.shadowMode = .deferred
-            light.shadowColor = NSColor(calibratedWhite: 0, alpha: 0.5)
-            node.light = light
-            node.name = "selectionSpotlight"
-            // Aim straight down (-Y). Only position + cone angles change at runtime.
-            node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
-            scene.rootNode.addChildNode(node)
-            spotlightNode = node
-        }
-
-        /// A flat warm-gradient disc that sits on the surface beneath the selected
-        /// item — the visible "circle of light" around the item. Scales with the
-        /// item's footprint.
-        private func configureSelectionCorona() {
-            let plane = SCNPlane(width: coronaBaseSize, height: coronaBaseSize)
-            let mat = SCNMaterial()
-            mat.lightingModel = .constant
-            // Texture lives in diffuse so `transparencyMode = .aOne` reads the
-            // gradient's actual alpha. (Putting it in emission with diffuse=clear
-            // made the entire material transparent — that was the long-standing
-            // reason the halo was never showing up.)
-            mat.diffuse.contents = Self.makeCoronaTexture()
-            mat.transparencyMode = .aOne
-            mat.isDoubleSided = true
-            mat.writesToDepthBuffer = false
-            mat.readsFromDepthBuffer = true
-            // Trilinear with mipmaps + edge clamping. Without mipFilter = .linear
-            // the texture is sampled with point-LOD at oblique viewing angles,
-            // producing diagonal moiré bands across the halo. Clamping the wrap
-            // mode also prevents the gradient from tiling at the plane edges.
-            mat.diffuse.minificationFilter = .linear
-            mat.diffuse.magnificationFilter = .linear
-            mat.diffuse.mipFilter = .linear
-            mat.diffuse.wrapS = .clamp
-            mat.diffuse.wrapT = .clamp
-            plane.firstMaterial = mat
-
-            let node = SCNNode(geometry: plane)
-            // Lay flat (facing +Y) so it sits on the surface like the existing labels.
-            node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
-            node.opacity = 0
-            node.renderingOrder = 5
-            node.castsShadow = false
-            node.name = "selectionCorona"
-            scene.rootNode.addChildNode(node)
-            coronaNode = node
-        }
-
-        /// A translucent warm-tinted cone of "volumetric" light from the spotlight
-        /// source down to the selected item. Apex narrow (point source), base wide
-        /// (matches the spot's pool). Cone is recycled across selections.
-        private func configureSelectionCone() {
-            let cone = SCNCone(
-                topRadius: coneBaseTopRadius,
-                bottomRadius: coneBaseBottomRadius,
-                height: coneBaseHeight
-            )
-            // 96 radial wedges (up from the default 48) so the cone's silhouette
-            // and any visible triangle edges read as a smooth circle rather than
-            // a faceted polygon, even at wide bottom radii.
-            cone.radialSegmentCount = 96
-            let mat = SCNMaterial()
-            mat.lightingModel = .constant
-            mat.diffuse.contents = NSColor(calibratedRed: 1.0, green: 0.88, blue: 0.55, alpha: 0.16)
-            mat.emission.contents = NSColor(calibratedRed: 1.0, green: 0.84, blue: 0.50, alpha: 0.16)
-            mat.transparencyMode = .aOne
-            mat.isDoubleSided = true
-            mat.writesToDepthBuffer = false
-            mat.readsFromDepthBuffer = true
-            mat.cullMode = .back
-            cone.firstMaterial = mat
-
-            let node = SCNNode(geometry: cone)
-            node.opacity = 0
-            node.renderingOrder = 4
-            node.castsShadow = false
-            node.name = "selectionCone"
-            scene.rootNode.addChildNode(node)
-            coneNode = node
-        }
+        // MARK: - Selection ring
 
         /// A flat warm-gold torus that lies on the surface around the selected
         /// item. Replaces the spot-light / corona approach: the ring is geometry,
@@ -678,9 +554,8 @@ struct SceneHostView: NSViewRepresentable {
             moveSpotlight(to: node)
         }
 
-        /// Position the selection ring around `target`. The spot light, corona,
-        /// and volumetric cone all stay parked at zero — the ring is the entire
-        /// selection feedback now.
+        /// Position the selection ring around `target`. The ring is the entire
+        /// selection feedback.
         private func moveSpotlight(to target: SCNNode) {
             guard let wrapper = selectionRingNode, let inner = selectionRingInner else { return }
             let world = target.worldPosition
@@ -709,100 +584,12 @@ struct SceneHostView: NSViewRepresentable {
             SCNTransaction.commit()
         }
 
-        /// Build a flat square-frame shape sized by `outerHalf` (half-side of
-        /// the outer rounded rect) with the given wall thickness and corner
-        /// radius. Path uses even-odd winding so the inner rect punches a hole.
-        private static func makeSelectionRingShape(
-            outerHalf: CGFloat, wallThickness: CGFloat, cornerRadius: CGFloat
-        ) -> SCNShape {
-            let innerHalf = max(0.001, outerHalf - wallThickness)
-            let outerCorner = min(cornerRadius, outerHalf * 0.5)
-            let innerCorner = max(0, outerCorner - wallThickness * 0.5)
-
-            let path = NSBezierPath()
-            path.appendRoundedRect(
-                NSRect(x: -outerHalf, y: -outerHalf, width: outerHalf * 2, height: outerHalf * 2),
-                xRadius: outerCorner, yRadius: outerCorner
-            )
-            path.appendRoundedRect(
-                NSRect(x: -innerHalf, y: -innerHalf, width: innerHalf * 2, height: innerHalf * 2),
-                xRadius: innerCorner, yRadius: innerCorner
-            )
-            path.windingRule = .evenOdd
-
-            let shape = SCNShape(path: path, extrusionDepth: wallThickness)
-            // Modest curve smoothness — the path is mostly straight edges
-            // anyway, the corners are the only places that need any segments.
-            shape.chamferRadius = 0
-            return shape
-        }
-
-        /// Position the volumetric cone with its narrow apex at the spotlight
-        /// source and its wide base on the item's *top* surface (not the floor).
-        /// Critical: if the cone reached the floor it would overlap the corona
-        /// plane and its radial wedge triangles would show as visible spokes
-        /// across the halo. Ending the cone at the item top leaves the floor
-        /// halo unobstructed.
-        private func moveCone(to target: SCNNode, bottomRadius: CGFloat, itemBaseY: CGFloat, lightY: CGFloat) {
-            guard let cone = coneNode else { return }
-            let world = target.worldPosition
-            let itemTopY = world.y + boxHeight(target) / 2
-            let coneHeight = lightY - itemTopY
-            let centerY = (lightY + itemTopY) / 2
-            // X/Z scale = circular radius scale (keeps the cone round). Y scale
-            // stretches the cone vertically so its base sits exactly on the
-            // item's TOP face and its apex at the light source.
-            let radialScale = bottomRadius / coneBaseBottomRadius
-            let yScale = coneHeight / coneBaseHeight
-
-            SCNTransaction.begin()
-            SCNTransaction.animationDuration = 0.28
-            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
-            cone.position = SCNVector3(world.x, centerY, world.z)
-            cone.scale = SCNVector3(radialScale, yScale, radialScale)
-            cone.opacity = 1.0
-            SCNTransaction.commit()
-        }
-
-        /// Position the corona disc at the base of `target` and scale it so its
-        /// visible bright ring lands clearly outside the item's footprint — a
-        /// proper halo around the item, not a thin sliver at its edge.
-        private func moveCorona(to target: SCNNode) {
-            guard let corona = coronaNode else { return }
-            let world = target.worldPosition
-            // Sit just above the target's bottom face (= floor or platform top).
-            let baseY = world.y - boxHeight(target) / 2 + 0.012
-            // Halo extent = footprint × 2.4. With this gradient (bright ring at
-            // 50% of the texture radius), the visible bright pool lands at world
-            // radius `footprint × 0.6` — exactly footprint/2 from the item edge,
-            // a clear halo around the slab. The cone bottom radius is set to
-            // `footprint / 2` in `moveSpotlight` so it lands on the item edge
-            // (no overhang past the plate) — i.e., the cone's bottom and the
-            // corona's bright ring are stacked: cone occupies the item, bright
-            // pool sits just outside it, they read as one effect.
-            let extent = footprint(target) * 2.4
-            let scale = extent / coronaBaseSize
-
-            SCNTransaction.begin()
-            SCNTransaction.animationDuration = 0.28
-            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
-            corona.position = SCNVector3(world.x, baseY, world.z)
-            corona.scale = SCNVector3(scale, scale, scale)
-            corona.opacity = 1.0
-            SCNTransaction.commit()
-        }
-
         /// Ramp the selection ring to zero (parked).
         private func hideSpotlight() {
             SCNTransaction.begin()
             SCNTransaction.animationDuration = 0.20
             SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeIn)
             selectionRingNode?.opacity = 0
-            // Belt-and-suspenders: the spot/corona/cone never go above zero
-            // anymore, but keep clearing them in case something nudges them.
-            spotlightNode?.light?.intensity = 0
-            coronaNode?.opacity = 0
-            coneNode?.opacity = 0
             SCNTransaction.commit()
         }
 
@@ -818,67 +605,6 @@ struct SceneHostView: NSViewRepresentable {
         /// Vertical extent of an interactive node's box geometry (zero if not a box).
         private func boxHeight(_ node: SCNNode) -> CGFloat {
             (node.geometry as? SCNBox)?.height ?? 0
-        }
-
-        /// Radial-gradient bitmap used as the corona's diffuse map. Warm amber
-        /// ring fading to fully-transparent at the edge.
-        ///
-        /// Rendered into a 16-bits-per-channel `NSBitmapImageRep` rather than via
-        /// `NSImage.lockFocus()` (which is 8-bit). With only 256 alpha levels the
-        /// gradient quantizes into visible diagonal bands when the corona is
-        /// viewed at an oblique angle — 16-bit precision keeps the falloff smooth.
-        private static func makeCoronaTexture() -> NSImage {
-            let pixels = 1024
-            let size = CGFloat(pixels)
-            guard let rep = NSBitmapImageRep(
-                bitmapDataPlanes: nil,
-                pixelsWide: pixels,
-                pixelsHigh: pixels,
-                bitsPerSample: 16,
-                samplesPerPixel: 4,
-                hasAlpha: true,
-                isPlanar: false,
-                colorSpaceName: .deviceRGB,
-                bytesPerRow: 0,
-                bitsPerPixel: 0
-            ), let nsctx = NSGraphicsContext(bitmapImageRep: rep) else {
-                return NSImage(size: NSSize(width: size, height: size))
-            }
-            rep.size = NSSize(width: size, height: size)
-
-            NSGraphicsContext.saveGraphicsState()
-            defer { NSGraphicsContext.restoreGraphicsState() }
-            NSGraphicsContext.current = nsctx
-            let ctx = nsctx.cgContext
-
-            let center = CGPoint(x: size / 2, y: size / 2)
-            // Single smooth ring: one continuous bump from 0 → peak → 0. The
-            // previous four-stop curve [0, 0.55, 0.85, 1] / [0, 0.90, 0.55, 0]
-            // had a deliberate brightness drop between 55% and 85% radius, which
-            // the eye saw as a dark concentric ring between two bright bands —
-            // the very "two-rings" artifact in the latest screenshot. With three
-            // stops there's nothing to interpret as a secondary band.
-            let colors = [
-                NSColor(calibratedRed: 1.00, green: 0.88, blue: 0.58, alpha: 0.00).cgColor,
-                NSColor(calibratedRed: 1.00, green: 0.84, blue: 0.50, alpha: 0.80).cgColor,
-                NSColor(calibratedRed: 1.00, green: 0.72, blue: 0.32, alpha: 0.00).cgColor,
-            ] as CFArray
-            if let gradient = CGGradient(
-                colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                colors: colors,
-                locations: [0, 0.5, 1]
-            ) {
-                ctx.drawRadialGradient(
-                    gradient,
-                    startCenter: center, startRadius: 0,
-                    endCenter: center, endRadius: size / 2,
-                    options: []
-                )
-            }
-
-            let image = NSImage(size: NSSize(width: size, height: size))
-            image.addRepresentation(rep)
-            return image
         }
 
         // MARK: - Focus request (sidebar → 3D)
