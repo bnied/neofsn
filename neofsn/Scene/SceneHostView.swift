@@ -180,8 +180,13 @@ struct SceneHostView: NSViewRepresentable {
             let node: SCNNode
             let center: SCNVector3   // world position of the level node (floor-top y)
             let halfExtent: CGFloat
+            let hasBack: Bool        // whether a front-center back tile is present
         }
-        private let levelDrop: CGFloat = 3.5   // modest vertical step, parent stays in frame
+        /// Camera never frames a level tighter than this half-extent, so folders with
+        /// just a few items don't zoom in uncomfortably close.
+        private let minLevelFramingExtent: CGFloat = 3.6
+        private let levelDrop: CGFloat = 3.5   // child sits a step below its parent
+        private let levelFadeDuration: TimeInterval = 0.6
 
         func syncFromViewModel() {
             guard let root = viewModel.currentRoot else { return }
@@ -207,11 +212,11 @@ struct SceneHostView: NSViewRepresentable {
 
             let path = root.url.path
             if let idx = levels.firstIndex(where: { $0.url.path == path }) {
-                // Navigated to a folder already in the stack (e.g. Back, or a breadcrumb)
-                // → pop everything deeper and re-frame it. No rebuild needed → synchronous.
-                popLevels(below: idx)
-                flyToLevel(levels[idx])
-                rebuildNodeIndex()
+                // Navigated to a folder already in the stack (Back or a breadcrumb)
+                // → zoom out: fade the deeper levels away, restore this one to full
+                // opacity, and fly the camera back to it.
+                popLevelsAnimated(below: idx)
+                flyToLevel(levels.last ?? levels[idx])
                 finishPreparing()
             } else if let idx = levels.lastIndex(where: { isDescendant(path, of: $0.url.path) }) {
                 // Descending from some existing level (not necessarily the deepest one —
@@ -239,17 +244,20 @@ struct SceneHostView: NSViewRepresentable {
         /// bitmap label per item) is the expensive step that used to freeze the UI for
         /// large folders; the loading overlay stays up until `attachLevel` finishes.
         private func pushLevel(root: FileSystemNode) {
-            let parentURL = navigableParentURL(for: root.url)
             // Capture the parent now (popLevels already ran); positioning is cheap and
             // happens on the main actor once the build returns.
             let parent = levels.last
+            // Show the back control whenever there's a parent level to return to; fall
+            // back to the navigable filesystem parent on a re-root (no parent level).
+            let parentURL = parent?.url ?? navigableParentURL(for: root.url)
             Task { [weak self] in
                 let built = await Task.detached(priority: .userInitiated) {
                     SceneBuilder.makeLevelNode(root: root, parentURL: parentURL)
                 }.value
                 guard let self else { return }
                 guard let view = self.scnView else {
-                    self.attachLevel(root: root, node: built.node, halfExtent: built.halfExtent, parent: parent)
+                    self.attachLevel(root: root, node: built.node, halfExtent: built.halfExtent,
+                                     hasBack: built.hasBack, parent: parent)
                     return
                 }
                 // Upload the level's geometry/materials/textures to the GPU on a
@@ -259,33 +267,48 @@ struct SceneHostView: NSViewRepresentable {
                 // rendering starts". Attach only once the resources are ready.
                 view.prepare([built.node]) { [weak self] _ in
                     Task { @MainActor in
-                        self?.attachLevel(root: root, node: built.node,
-                                          halfExtent: built.halfExtent, parent: parent)
+                        self?.attachLevel(root: root, node: built.node, halfExtent: built.halfExtent,
+                                          hasBack: built.hasBack, parent: parent)
                     }
                 }
             }
         }
 
-        /// Main-actor tail of `pushLevel`: position the freshly-built level, add it to
-        /// the scene, frame the camera, and drop the loading overlay.
-        private func attachLevel(root: FileSystemNode, node: SCNNode, halfExtent: CGFloat, parent: Level?) {
+        /// Main-actor tail of `pushLevel`: anchor the freshly-built level on the folder
+        /// tile that was entered, cross-fade it in as the parent fades out, fly the
+        /// camera in, and drop the loading overlay.
+        private func attachLevel(root: FileSystemNode, node: SCNNode, halfExtent: CGFloat, hasBack: Bool, parent: Level?) {
             let center: SCNVector3
             if let parent {
-                // Place the child BESIDE and just below the parent: offset in +X by both
-                // half-extents (plus a cell) so the plates don't overlap, and drop only a
-                // little. The camera then makes a modest pan to the child and the parent
-                // stays visible at the edge as context — not a full-screen redraw, and no
-                // occlusion since the parent sits entirely to the left of the child.
-                let xOffset = parent.halfExtent + halfExtent + SceneBuilder.cellSize
-                center = SCNVector3(parent.center.x + xOffset, parent.center.y - levelDrop, 0)
+                // Center the child on the folder tile we entered (dropped a step so the
+                // parent reads as behind/above). The camera then flies in toward it, so
+                // the tile visually "becomes" its contents.
+                let tile = folderTileWorldPosition(in: parent, url: root.url) ?? parent.center
+                center = SCNVector3(tile.x, parent.center.y - levelDrop, tile.z)
             } else {
                 center = SCNVector3(0, 0, 0)
             }
             node.position = center
+            node.opacity = parent == nil ? 1 : 0   // fresh root shows at once; children fade in
             scene.rootNode.addChildNode(node)
-            let level = Level(url: root.url, node: node, center: center, halfExtent: halfExtent)
+            let level = Level(url: root.url, node: node, center: center, halfExtent: halfExtent, hasBack: hasBack)
             levels.append(level)
             lastHalfExtent = halfExtent
+
+            // Cross-fade the new level in while the parent fades out, then hide the
+            // parent so it's neither drawn nor hit-testable. It stays in the stack so
+            // going back can fade it straight back in.
+            if let parent {
+                let parentNode = parent.node
+                SCNTransaction.begin()
+                SCNTransaction.animationDuration = levelFadeDuration
+                SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                SCNTransaction.completionBlock = { Task { @MainActor in parentNode.isHidden = true } }
+                node.opacity = 1
+                parentNode.opacity = 0
+                SCNTransaction.commit()
+            }
+
             flyToLevel(level)
             rebuildNodeIndex()
             // Keep the overlay up until SceneKit has actually drawn the first frame
@@ -294,8 +317,31 @@ struct SceneHostView: NSViewRepresentable {
             clearOverlayOnNextRender = true
         }
 
+        /// World position of the subdir tile for `url` within `level` — the anchor the
+        /// child level zooms out from. Nil if that tile isn't in the level.
+        private func folderTileWorldPosition(in level: Level, url: URL) -> SCNVector3? {
+            for child in level.node.childNodes
+            where child.name == "pedestal:subdir" && child.fsPayload?.url == url {
+                return child.worldPosition
+            }
+            return nil
+        }
+
         private func flyToLevel(_ level: Level) {
-            flyToFrame(center: level.center, halfExtent: level.halfExtent)
+            var center = level.center
+            var extent = level.halfExtent
+            // The back control sits just outside the grid's NW corner. Fold it into
+            // the frame: take the bounding box of the grid (+halfExtent) and the back
+            // corner, then center on it so the whole plate (contents + back) shows.
+            if level.hasBack {
+                let nwMost = -(level.halfExtent + SceneBuilder.cellSpacing + 1.6)
+                let c = (nwMost + level.halfExtent) / 2
+                center = SCNVector3(center.x + c, center.y, center.z + c)
+                extent = (level.halfExtent - nwMost) / 2
+            }
+            // Floor the zoom so sparse folders don't end up uncomfortably close.
+            extent = max(extent, minLevelFramingExtent)
+            flyToFrame(center: center, halfExtent: extent)
         }
 
         /// Single framing routine for everything (overviews, levels, subfolder focus).
@@ -327,6 +373,29 @@ struct SceneHostView: NSViewRepresentable {
             guard idx + 1 < levels.count else { return }
             for lvl in levels[(idx + 1)...] { lvl.node.removeFromParentNode() }
             levels.removeSubrange((idx + 1)...)
+        }
+
+        /// Animated counterpart to `popLevels` for "go back up the tree": fade the
+        /// deeper levels out (removing them when the fade finishes) and fade the
+        /// now-current level back in (un-hiding it first).
+        private func popLevelsAnimated(below idx: Int) {
+            let doomed = (idx + 1 < levels.count) ? Array(levels[(idx + 1)...]) : []
+            if !doomed.isEmpty { levels.removeSubrange((idx + 1)...) }
+            let targetNode = levels.last?.node
+            targetNode?.isHidden = false   // un-hide so it can fade back in
+
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = levelFadeDuration
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            SCNTransaction.completionBlock = { [weak self] in
+                Task { @MainActor in
+                    doomed.forEach { $0.node.removeFromParentNode() }
+                    self?.rebuildNodeIndex()
+                }
+            }
+            doomed.forEach { $0.node.opacity = 0 }
+            targetNode?.opacity = 1
+            SCNTransaction.commit()
         }
 
         // MARK: - Reset / focus a subfolder (in-place, parent context preserved)

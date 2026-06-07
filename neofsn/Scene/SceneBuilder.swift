@@ -61,6 +61,14 @@ enum SceneBuilder {
     // budget can never touch.
     static var fileLabelMaxWidth: CGFloat { (fileBaseWidth + cellSpacing) * 0.95 }
 
+    /// Footprint of a subfolder tile, scaled (log) by how many items it holds so
+    /// fuller folders read as bigger. Clamped at the top so one dense folder can't
+    /// blow out the level grid. An empty folder is the same size as a file slab.
+    static func subdirTileWidth(itemCount: Int) -> CGFloat {
+        let scale = 1.0 + min(1.4, log10(Double(max(itemCount, 1))) * 0.7)  // 1.0× … 2.4×
+        return fileBaseWidth * scale
+    }
+
     struct LayoutMetrics {
         let halfExtent: CGFloat
     }
@@ -74,29 +82,31 @@ enum SceneBuilder {
     static func makeLevelNode(
         root: FileSystemNode,
         parentURL: URL? = nil
-    ) -> (node: SCNNode, halfExtent: CGFloat) {
+    ) -> (node: SCNNode, halfExtent: CGFloat, hasBack: Bool) {
         let level = SCNNode()
         level.name = "level"
 
-        // Items: optional back-up tile first, then subdirs, then files.
+        // Grid items: subdirs then files. The up/back tile is NOT in the grid — it's
+        // placed separately at the front-center of the plate (see below) so it's a
+        // clear, dedicated control instead of a cell lost among the contents.
         enum ItemKind {
-            case back(URL)
             case subdir(FileSystemNode)
             case file(FileSystemNode)
         }
         var items: [ItemKind] = []
-        if let parentURL {
-            items.append(.back(parentURL))
-        }
         items += root.subdirectories.map { .subdir($0) }
         items += root.files.map { .file($0) }
 
         let cols = max(1, Int(ceil(sqrt(Double(max(items.count, 1))))))
         let rows = max(1, Int(ceil(Double(max(items.count, 1)) / Double(cols))))
-        // Files, folder tiles, and the back tile all share one footprint now
-        // (folders no longer grow with their contents — you descend to see them),
-        // so the grid step is uniform.
-        let step = fileBaseWidth + cellSpacing
+        // Folder tiles grow with their item count, so the grid step has to track the
+        // widest item on this level (a file is `fileBaseWidth`); otherwise a big
+        // folder would slop into its neighbors.
+        var maxItemWidth = fileBaseWidth
+        for case .subdir(let n) in items {
+            maxItemWidth = max(maxItemWidth, subdirTileWidth(itemCount: n.children.count))
+        }
+        let step = maxItemWidth + cellSpacing
         let halfExtent = max(CGFloat(cols), CGFloat(rows)) * step / 2
 
         level.addChildNode(makeFloorPlate(halfExtent: halfExtent))
@@ -110,8 +120,6 @@ enum SceneBuilder {
             let z = originZ + CGFloat(row) * step
             let view: SCNNode
             switch item {
-            case .back(let url):
-                view = makeBackNode(parentURL: url)
             case .subdir(let n):
                 view = makeSubdirNode(subdir: n)
             case .file(let n):
@@ -121,9 +129,16 @@ enum SceneBuilder {
             level.addChildNode(view)
         }
 
-        // Empty-folder message, centered on the floor when there are no real
-        // children. The back tile (if present) is unaffected — it sits at the
-        // first grid cell and the message floats above the otherwise-empty floor.
+        // Back control at the plate's NW corner (just outside the content grid),
+        // when there's a parent to navigate to. The framing includes this corner.
+        if let parentURL {
+            let back = makeBackNode(parentURL: parentURL)
+            let nw = halfExtent + cellSpacing
+            back.position = SCNVector3(-nw, back.position.y, -nw)  // NW corner, on the floor
+            level.addChildNode(back)
+        }
+
+        // Empty-folder message, centered on the floor when there are no real children.
         if root.children.isEmpty {
             let label = makeFlatLabel(
                 text: root.isReadable ? "no files found" : "permission denied",
@@ -134,25 +149,28 @@ enum SceneBuilder {
             level.addChildNode(label)
         }
 
-        return (level, halfExtent)
+        return (level, halfExtent, parentURL != nil)
     }
 
-    // MARK: - Back-up navigation tile
+    // MARK: - Back-up control
 
-    /// A flat slab that, when clicked, navigates one level up the tree. Stored
-    /// `fsURL` is the parent folder's path; the click handler in SceneHostView
-    /// dispatches on the `navup` node name.
+    /// The "up" control: a glowing amber back tile (dark back-arrow glyph + "back"),
+    /// placed at the plate's NW corner (not in the content grid). A bit larger than a
+    /// file tile so it reads at the far corner. Clicking navigates one level up; the
+    /// handler dispatches on the `navup` node name.
     private static func makeBackNode(parentURL: URL) -> SCNNode {
+        let baseWidth = fileBaseWidth * 1.3
         let height = fileMaxHeight * 0.6
-        let baseWidth = fileBaseWidth
 
         let geom = SCNBox(width: baseWidth, height: height, length: baseWidth, chamferRadius: 0.03)
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
-        // Warm amber so it stands apart from blue folders and FileKind file colors.
+        // Warm amber, distinct from blue folders and the file colors.
         mat.diffuse.contents = NSColor(calibratedRed: 0.78, green: 0.58, blue: 0.22, alpha: 1)
         mat.metalness.contents = 0.10
         mat.roughness.contents = 0.55
+        // Emissive so the tile self-illuminates as a glowing control.
+        mat.emission.contents = NSColor(calibratedRed: 0.70, green: 0.46, blue: 0.12, alpha: 1)
         geom.firstMaterial = mat
 
         let node = SCNNode(geometry: geom)
@@ -161,22 +179,23 @@ enum SceneBuilder {
         node.fsPayload = NodePayload(url: parentURL, name: parentURL.lastPathComponent)
         node.castsShadow = true
 
-        // Up-arrow icon at the back half, label at the front (matches the
-        // labeled-file layout so the slab reads as part of the level grid).
+        // Back-arrow glyph at the back half, "back" label at the front — dark for
+        // contrast on the bright amber tile.
         let topY = height / 2 + 0.012
-        if let icon = makeBackIconNode(width: baseWidth * 0.58) {
-            icon.position = SCNVector3(0, topY, -(fileCapHeight / 2 + 0.02))
+        if let icon = makeBackIconNode(width: baseWidth * 0.42) {
+            icon.position = SCNVector3(0, topY, -(fileCapHeight / 2 + 0.04))
             node.addChildNode(icon)
         }
-        let label = makeFlatLabel(text: "back", accent: false, maxWorldWidth: baseWidth * 0.92)
-        label.position = SCNVector3(0, topY, baseWidth / 2 - fileCapHeight / 2 - 0.04)
+        let label = makeFlatLabel(text: "back", accent: false, maxWorldWidth: baseWidth * 0.9, dark: true)
+        label.position = SCNVector3(0, topY, baseWidth / 2 - fileCapHeight / 2 - 0.06)
         node.addChildNode(label)
 
         return node
     }
 
     private static func makeBackIconNode(width: CGFloat) -> SCNNode? {
-        guard let image = renderSFSymbol("arrow.up.backward", tint: NSColor(calibratedWhite: 0.99, alpha: 1)) else {
+        // Dark back-arrow glyph for high contrast on the glowing amber tile.
+        guard let image = renderSFSymbol("arrow.backward", tint: NSColor(calibratedWhite: 0.10, alpha: 1)) else {
             return nil
         }
         let plane = SCNPlane(width: width, height: width)
@@ -191,7 +210,7 @@ enum SceneBuilder {
         let node = SCNNode(geometry: plane)
         node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
         node.name = "icon"
-        node.castsShadow = false   // flat glyph planes never need to cast shadows
+        node.castsShadow = false
         return node
     }
 
@@ -271,7 +290,8 @@ enum SceneBuilder {
     /// Not drawing every nested file/folder is what keeps a deep tree cheap to
     /// build and render. The tile IS the named interactive node (click → descend).
     private static func makeSubdirNode(subdir: FileSystemNode) -> SCNNode {
-        let width = fileBaseWidth
+        // Footprint scales with how many items the folder holds.
+        let width = subdirTileWidth(itemCount: subdir.children.count)
         let height = subdirPlatformHeight
 
         let geom = SCNBox(width: width, height: height, length: width, chamferRadius: 0.04)
@@ -368,21 +388,23 @@ enum SceneBuilder {
     /// from the default camera), so the text reads correctly to a viewer at +Z.
     /// The label is truncated so its world width never exceeds `maxWorldWidth`
     /// (one grid cell) — neighboring labels therefore can never overlap.
-    private static func makeFlatLabel(text: String, accent: Bool, maxWorldWidth: CGFloat) -> SCNNode {
+    private static func makeFlatLabel(text: String, accent: Bool, maxWorldWidth: CGFloat, dark: Bool = false) -> SCNNode {
         let capHeight = accent ? accentCapHeight : fileCapHeight
         return makeFlatLabelCore(
             text: text, bold: accent, capHeight: capHeight,
-            maxWorldWidth: maxWorldWidth, name: "label"
+            maxWorldWidth: maxWorldWidth, name: "label", dark: dark
         )
     }
 
     /// Shared label builder: renders `text` to a texture and lays it flat (facing up,
     /// reading toward the camera), truncated so its world width fits `maxWorldWidth`.
+    /// `dark` renders near-black text with a light halo — for legibility on the bright
+    /// amber back tile.
     private static func makeFlatLabelCore(
-        text: String, bold: Bool, capHeight: CGFloat, maxWorldWidth: CGFloat, name: String
+        text: String, bold: Bool, capHeight: CGFloat, maxWorldWidth: CGFloat, name: String, dark: Bool = false
     ) -> SCNNode {
         let maxAspect = maxWorldWidth / capHeight
-        let (_, image, aspect) = renderLabelTexture(text: text, accent: bold, maxAspect: maxAspect)
+        let (_, image, aspect) = renderLabelTexture(text: text, accent: bold, maxAspect: maxAspect, dark: dark)
 
         let worldWidth = capHeight * aspect
         let plane = SCNPlane(width: worldWidth, height: capHeight)
@@ -409,18 +431,18 @@ enum SceneBuilder {
     /// a soft dark halo for legibility against both gold platforms and the dark floor.
     /// Returns the displayed string, the image, and its width/height aspect ratio.
     private static func renderLabelTexture(
-        text: String, accent: Bool, maxAspect: CGFloat
+        text: String, accent: Bool, maxAspect: CGFloat, dark: Bool = false
     ) -> (display: String, image: NSImage, aspect: CGFloat) {
         // Fixed render point-size; world scaling happens via the plane geometry.
         let pointSize: CGFloat = 72
         let font = labelFont(size: pointSize, accent: accent)
 
-        // Uniform label styling for files and folders alike: bright text with a
-        // strong dark halo, so it stays legible on gold platforms, saturated cubes,
-        // and the dark floor without color-coding files vs folders differently.
-        let fill = NSColor(calibratedWhite: 0.99, alpha: 1)
+        // Default: bright text with a strong dark halo, legible on the dark floor and
+        // saturated slabs. `dark` flips to near-black text with a light halo, for
+        // legibility on the bright amber back tile.
+        let fill = dark ? NSColor(calibratedWhite: 0.08, alpha: 1) : NSColor(calibratedWhite: 0.99, alpha: 1)
         let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.92)
+        shadow.shadowColor = (dark ? NSColor.white : NSColor.black).withAlphaComponent(dark ? 0.75 : 0.92)
         shadow.shadowBlurRadius = pointSize * 0.18
         shadow.shadowOffset = .zero
 
