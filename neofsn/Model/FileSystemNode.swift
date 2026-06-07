@@ -2,7 +2,11 @@ import Foundation
 
 /// One entry in the scanned filesystem tree (a file or a directory). Reference type
 /// so SceneKit nodes and SwiftUI rows can share identity by `id`.
-final class FileSystemNode: Identifiable, Hashable {
+///
+/// `@unchecked Sendable`: every stored property is immutable after `init` (the
+/// scanner builds the whole tree, then only reads it), so the tree can safely be
+/// handed to a background task that builds the 3D level off the main thread.
+final class FileSystemNode: Identifiable, Hashable, @unchecked Sendable {
     let id = UUID()
     let url: URL
     let name: String

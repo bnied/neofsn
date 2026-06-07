@@ -53,8 +53,11 @@ private struct WindowConfigurator: NSViewRepresentable {
         // Remove the separator line that macOS 11+ draws below the title bar
         // (macOS 26 renders it heavier; this is one candidate for the stripe).
         window.titlebarSeparatorStyle = .none
-        // Drop any AppKit-level toolbar reference so the window doesn't
-        // reserve toolbar space at the AppKit layer either.
+        // Drop the AppKit toolbar so the window doesn't reserve toolbar space —
+        // that reservation is what renders the lighter "Liquid Glass" stripe
+        // across the top in fullscreen on macOS 26. This unavoidably also removes
+        // NavigationSplitView's native sidebar toggle (it lives in the toolbar),
+        // so the sidebar toggle is provided as an in-scene control in TopBar.
         window.toolbar = nil
     }
 }
