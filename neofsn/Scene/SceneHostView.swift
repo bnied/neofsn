@@ -1,5 +1,5 @@
 import SwiftUI
-import SceneKit
+@preconcurrency import SceneKit
 import AppKit
 import Quartz
 
@@ -613,28 +613,20 @@ struct SceneHostView: NSViewRepresentable {
             guard let req = viewModel.sceneFocusRequest, req.token != lastFocusToken else { return }
             lastFocusToken = req.token
 
+            // If the item is rendered in the current scene (file or folder tile),
+            // just frame it — selecting a folder shouldn't open it.
             if let node = findNode(forPath: req.url.path) {
-                if node.name == "pedestal:subdir" {
-                    enterSubdir(url: req.url)
-                } else {
-                    flyToFrame(
-                        center: node.worldPosition,
-                        halfExtent: SceneBuilder.fileBaseWidth / 2,
-                        duration: 0.5,
-                        tight: true
-                    )
-                }
+                flyToFrame(
+                    center: node.worldPosition,
+                    halfExtent: footprint(node) / 2,
+                    duration: 0.5,
+                    tight: true
+                )
                 return
             }
             // Not in the current scene (deeper than what's rendered) — re-root to a
             // DIRECTORY so it becomes a new layer. Never re-root onto a file.
             viewModel.descend(into: directoryToReRoot(for: req.url))
-        }
-
-        /// Enter a subfolder by re-rooting it as a new layer below the parent.
-        /// Folder contents aren't rendered inline, so this always descends.
-        private func enterSubdir(url: URL?) {
-            if let url { viewModel.descend(into: url) }
         }
 
         /// Resolve a URL to the directory we should re-root to: the URL itself if it's
@@ -801,26 +793,21 @@ struct SceneHostView: NSViewRepresentable {
                 return
             }
             if clickCount >= 2 {
-                // Double click → navigate / open
+                // Double click → open: files in the default app, folders by descending.
                 if target.name == "file", let url {
                     NSWorkspace.shared.open(url)
                     viewModel.select(url)
                 } else if target.name == "pedestal:subdir", let url {
                     viewModel.descend(into: url)
                 }
-            } else if target.name == "pedestal:subdir" {
-                // Single click on a folder descends into it (its contents aren't
-                // rendered inline — descending re-roots it as a new layer).
-                viewModel.select(url)
-                enterSubdir(url: url)
             } else {
-                // Single click on a file selects it and frames it with the camera
-                // (same angle as everything else), dollied in close FSN-style so
-                // the slab fills the frame.
+                // Single click → select and frame the item (file or folder), dollied
+                // in close FSN-style. Folders are opened by double-click, not a single
+                // click.
                 viewModel.select(url)
                 flyToFrame(
                     center: target.worldPosition,
-                    halfExtent: SceneBuilder.fileBaseWidth / 2,
+                    halfExtent: footprint(target) / 2,
                     duration: 0.45,
                     tight: true
                 )

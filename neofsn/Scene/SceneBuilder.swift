@@ -217,17 +217,30 @@ enum SceneBuilder {
     // MARK: - Floor
 
     /// Finite floor plate, sized to the grid, with its top surface at local y = 0.
+    /// Built as an extruded rounded rectangle so the plate reads as a round-rect
+    /// (a chamfered `SCNBox` can only round corners up to half its thickness).
     private static func makeFloorPlate(halfExtent: CGFloat) -> SCNNode {
         let side = (halfExtent + cellSize) * 2
-        let box = SCNBox(width: side, height: floorThickness, length: side, chamferRadius: 0.06)
+        let cornerRadius = min(side * 0.06, 2.0)
+
+        let rect = NSRect(x: -side / 2, y: -side / 2, width: side, height: side)
+        let path = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
+        path.flatness = 0.1   // smooth corner tessellation
+        let shape = SCNShape(path: path, extrusionDepth: floorThickness)
+        shape.chamferRadius = 0.04   // softens the top/bottom rim
+
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
         mat.diffuse.contents = NSColor(calibratedWhite: 0.10, alpha: 1)
         mat.roughness.contents = 0.92
         mat.metalness.contents = 0.0
-        box.firstMaterial = mat
-        let node = SCNNode(geometry: box)
-        node.position = SCNVector3(0, -floorThickness / 2, 0)  // top surface at y = 0
+        shape.firstMaterial = mat
+
+        let node = SCNNode(geometry: shape)
+        // SCNShape lies in the XY plane extruding +Z; rotate -90° about X so it lies
+        // flat (footprint in XZ, thickness in Y), then drop it so the top is at y = 0.
+        node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
+        node.position = SCNVector3(0, -floorThickness, 0)
         node.name = "floor"
         node.castsShadow = true
         return node
