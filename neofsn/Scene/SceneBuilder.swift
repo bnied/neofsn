@@ -423,7 +423,7 @@ enum SceneBuilder {
         node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
         node.name = name
         node.castsShadow = false
-        node.renderingOrder = name == "focusLabel" ? 11 : 10
+        node.renderingOrder = 10   // above floor/plates so labels never z-fight
         return node
     }
 
