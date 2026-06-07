@@ -29,6 +29,7 @@ struct ContentView: View {
         .containerBackground(Theme.backdrop, for: .window)
         .preferredColorScheme(.dark)
         .focusable()
+        .focusEffectDisabled()
         .onKeyPress(.space) {
             previewSelected()
             return .handled
@@ -49,14 +50,29 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea(edges: .top)
                     .clipped()
-            } else {
+            } else if !viewModel.isScanning {
+                // Only when idle with no folder — during the first scan the loading
+                // overlay takes over instead, so the two never blend together.
+                // `.identity` removal (no cross-fade) means it's gone the instant
+                // scanning starts, leaving only the overlay fading in over backdrop.
                 EmptyStateView { viewModel.chooseFolder() }
                     .ignoresSafeArea(edges: .top)
+                    .transition(.identity)
+            }
+
+            // Full-canvas loading overlay while a scan is in flight. Sits above the
+            // scene but below the TopBar, so the breadcrumb stays put when navigating
+            // into a slow folder; on first open (no TopBar yet) it covers the whole
+            // detail area over the opaque base backdrop.
+            if isLoading {
+                LoadingOverlay(title: viewModel.scanningTitle)
+                    .ignoresSafeArea(edges: .top)
+                    .transition(.opacity)
             }
 
             VStack(spacing: 14) {
                 if viewModel.currentRoot != nil {
-                    TopBar(viewModel: viewModel)
+                    TopBar(viewModel: viewModel, columnVisibility: $columnVisibility)
                 }
                 Spacer(minLength: 0)
                 if viewModel.actionableURL != nil {
@@ -68,11 +84,92 @@ struct ContentView: View {
             .padding(.top, 0)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .animation(.easeInOut(duration: 0.25), value: isLoading)
     }
+
+    /// Scan-in-flight or building the 3D scene — either way, show the loading overlay.
+    private var isLoading: Bool { viewModel.isScanning || viewModel.isPreparingScene }
 
     /// Quick Look the actionable item (bound to the Space key).
     private func previewSelected() {
         viewModel.quickLook()
+    }
+}
+
+// MARK: - Loading overlay
+
+/// Full-canvas scanning indicator shown while a folder is being read. Echoes the
+/// empty-state aesthetic (scope motif + serif wordmark) so the wait reads as part
+/// of the app rather than a generic spinner.
+private struct LoadingOverlay: View {
+    let title: String?
+    @State private var pulse = false
+
+    var body: some View {
+        ZStack {
+            Theme.backdrop
+
+            VStack(spacing: 22) {
+                Image(systemName: "scope")
+                    .font(.system(size: 38, weight: .ultraLight))
+                    .foregroundStyle(Theme.accent)
+                    .opacity(pulse ? 0.95 : 0.4)
+                    .scaleEffect(pulse ? 1.05 : 0.95)
+
+                VStack(spacing: 12) {
+                    Text("scanning filesystem")
+                        .capsLabel(color: Theme.textSecondary)
+                        .tracking(3.5)
+
+                    if let title, !title.isEmpty {
+                        Text(title)
+                            .font(Theme.display(30, weight: .ultraLight))
+                            .italic()
+                            .tracking(-0.5)
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 420)
+                    }
+                }
+
+                ScanBar()
+                    .padding(.top, 6)
+            }
+            .padding(40)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
+    }
+}
+
+/// Indeterminate amber "scan" bar that sweeps left↔right on a faint track — a
+/// theme-matched replacement for the system linear ProgressView (whose default
+/// blue track clashed with the dark canvas).
+private struct ScanBar: View {
+    @State private var slide = false
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let seg = w * 0.4
+            Capsule()
+                .fill(Theme.accent)
+                .frame(width: seg)
+                .offset(x: slide ? w - seg : 0)
+        }
+        .frame(width: 200, height: 3)
+        .background(Capsule().fill(Theme.hairline))
+        .clipShape(Capsule())
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                slide = true
+            }
+        }
     }
 }
 
@@ -184,9 +281,19 @@ private struct EmptyStateView: View {
 
 private struct TopBar: View {
     @ObservedObject var viewModel: BrowserViewModel
+    @Binding var columnVisibility: NavigationSplitViewVisibility
 
     var body: some View {
         HStack(spacing: 10) {
+            iconButton(systemName: "sidebar.leading", help: "Toggle Sidebar (⌃⌘S)") {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
+                }
+            }
+            .keyboardShortcut("s", modifiers: [.command, .control])
+
+            Rectangle().fill(Theme.hairline).frame(width: 0.5, height: 18)
+
             iconButton(systemName: "chevron.left", help: "Back (⌘[)") {
                 viewModel.goBack()
             }

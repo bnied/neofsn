@@ -30,6 +30,7 @@ struct SceneHostView: NSViewRepresentable {
         view.rendersContinuously = true
         view.autoresizingMask = [.width, .height]
         view.coordinator = context.coordinator
+        view.delegate = context.coordinator   // render-loop callback for overlay handoff
         context.coordinator.scnView = view
         context.coordinator.installEventMonitors()
         context.coordinator.flyCamera.start()
@@ -55,18 +56,33 @@ struct SceneHostView: NSViewRepresentable {
     // MARK: - Coordinator
 
     @MainActor
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, SCNSceneRendererDelegate {
         let scene: SCNScene
         let viewModel: BrowserViewModel
         weak var scnView: SCNView?
         let flyCamera: FlyCameraController
+
+        /// Set right after a freshly-built level is added to the scene; the render
+        /// delegate flips the loading overlay off only once SceneKit has actually
+        /// drawn the first frame containing it — so there's no black gap between
+        /// the overlay disappearing and the scene appearing. `nonisolated(unsafe)`
+        /// because the delegate callback isn't main-actor isolated; it's a single
+        /// bool flag, so the unsynchronized access is benign.
+        nonisolated(unsafe) private var clearOverlayOnNextRender = false
+
+        /// SCNView render-loop callback (fires every frame). Drops the loading
+        /// overlay the first frame after a new level is attached and drawn.
+        nonisolated func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
+            guard clearOverlayOnNextRender else { return }
+            clearOverlayOnNextRender = false
+            Task { @MainActor [weak self] in self?.finishPreparing() }
+        }
 
         private var lastRootID: UUID?
         private var lastFocusToken: Int = 0
         private var lastResetToken: Int = 0
         private var lastColorRebuildToken: Int = 0
         private var lastHalfExtent: CGFloat = 8
-        private var focusedSubdir: SCNNode?
         private var focusLabelNodes: [SCNNode] = []
         private var levels: [Level] = []
         private var lastSelectedPath: String?
@@ -173,56 +189,95 @@ struct SceneHostView: NSViewRepresentable {
 
             let colorChanged = viewModel.colorRebuildToken != lastColorRebuildToken
             let rootChanged = lastRootID != root.id
-            guard rootChanged || colorChanged else { return }
+            guard rootChanged || colorChanged else { finishPreparing(); return }
             lastRootID = root.id
             lastColorRebuildToken = viewModel.colorRebuildToken
             clearHover()
             clearFocusLabels()
             hideSpotlight()
-            focusedSubdir = nil
 
             // A color-mode swap with no navigation: walk every file slab in the
             // scene and reapply diffuse colors. Cheap, geometry stays put, the
             // camera frame is preserved.
             if colorChanged && !rootChanged {
                 SceneBuilder.recolorFileSlabs(under: scene.rootNode)
+                finishPreparing()
                 return
             }
 
             let path = root.url.path
             if let idx = levels.firstIndex(where: { $0.url.path == path }) {
                 // Navigated to a folder already in the stack (e.g. Back, or a breadcrumb)
-                // → pop everything deeper and re-frame it.
+                // → pop everything deeper and re-frame it. No rebuild needed → synchronous.
                 popLevels(below: idx)
                 flyToLevel(levels[idx])
+                rebuildNodeIndex()
+                finishPreparing()
             } else if let idx = levels.lastIndex(where: { isDescendant(path, of: $0.url.path) }) {
                 // Descending from some existing level (not necessarily the deepest one —
                 // the clicked folder may live on a higher, still-visible plate). Pop any
                 // levels deeper than that ancestor, then add the new layer below it.
                 popLevels(below: idx)
-                pushLevel(root: root)
+                pushLevel(root: root)   // async build off the main thread
             } else {
                 // Unrelated root (freshly opened) → reset the stack.
                 levels.forEach { $0.node.removeFromParentNode() }
                 levels.removeAll()
-                pushLevel(root: root)
+                pushLevel(root: root)   // async build off the main thread
             }
-
-            rebuildNodeIndex()
         }
 
+        /// Clear the view-model's "preparing scene" flag (drops the loading overlay)
+        /// only if it's actually set, so routine `updateNSView` calls don't publish a
+        /// redundant change and spin the update loop.
+        private func finishPreparing() {
+            if viewModel.isPreparingScene { viewModel.isPreparingScene = false }
+        }
+
+        /// Build a fresh level for `root` OFF the main thread, then attach it on the
+        /// main actor. Building (constructing hundreds of `SCNNode`s and rendering a
+        /// bitmap label per item) is the expensive step that used to freeze the UI for
+        /// large folders; the loading overlay stays up until `attachLevel` finishes.
         private func pushLevel(root: FileSystemNode) {
             let parentURL = navigableParentURL(for: root.url)
-            let (node, halfExtent) = SceneBuilder.makeLevelNode(root: root, parentURL: parentURL)
+            // Capture the parent now (popLevels already ran); positioning is cheap and
+            // happens on the main actor once the build returns.
+            let parent = levels.last
+            Task { [weak self] in
+                let built = await Task.detached(priority: .userInitiated) {
+                    SceneBuilder.makeLevelNode(root: root, parentURL: parentURL)
+                }.value
+                guard let self else { return }
+                guard let view = self.scnView else {
+                    self.attachLevel(root: root, node: built.node, halfExtent: built.halfExtent, parent: parent)
+                    return
+                }
+                // Upload the level's geometry/materials/textures to the GPU on a
+                // background thread BEFORE it enters the live scene. Without this,
+                // the first frame that renders the new level uploads hundreds of
+                // label textures on the main thread — the remaining hitch "when
+                // rendering starts". Attach only once the resources are ready.
+                view.prepare([built.node]) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.attachLevel(root: root, node: built.node,
+                                          halfExtent: built.halfExtent, parent: parent)
+                    }
+                }
+            }
+        }
+
+        /// Main-actor tail of `pushLevel`: position the freshly-built level, add it to
+        /// the scene, frame the camera, and drop the loading overlay.
+        private func attachLevel(root: FileSystemNode, node: SCNNode, halfExtent: CGFloat, parent: Level?) {
             let center: SCNVector3
-            if let top = levels.last {
+            if let parent {
                 // Place the child BESIDE and just below the parent: offset in +X by both
                 // half-extents (plus a cell) so the plates don't overlap, and drop only a
                 // little. The camera then makes a modest pan to the child and the parent
                 // stays visible at the edge as context — not a full-screen redraw, and no
                 // occlusion since the parent sits entirely to the left of the child.
-                let xOffset = top.halfExtent + halfExtent + SceneBuilder.cellSize
-                center = SCNVector3(top.center.x + xOffset, top.center.y - levelDrop, 0)
+                let xOffset = parent.halfExtent + halfExtent + SceneBuilder.cellSize
+                center = SCNVector3(parent.center.x + xOffset, parent.center.y - levelDrop, 0)
             } else {
                 center = SCNVector3(0, 0, 0)
             }
@@ -232,6 +287,11 @@ struct SceneHostView: NSViewRepresentable {
             levels.append(level)
             lastHalfExtent = halfExtent
             flyToLevel(level)
+            rebuildNodeIndex()
+            // Keep the overlay up until SceneKit has actually drawn the first frame
+            // containing this level (the render delegate clears it), so the wait
+            // never flashes to a black scene before the geometry appears.
+            clearOverlayOnNextRender = true
         }
 
         private func flyToLevel(_ level: Level) {
@@ -285,30 +345,10 @@ struct SceneHostView: NSViewRepresentable {
             (scnView as? InteractiveSCNView)?.toggleQuickLook()
         }
 
-        /// Re-frame the deepest (current) level and clear any focused-subfolder labels.
+        /// Re-frame the deepest (current) level.
         func resetView() {
             clearFocusLabels()
-            focusedSubdir = nil
             if let level = levels.last { flyToLevel(level) }
-        }
-
-        /// Fly into a subfolder platform without rebuilding (parent stays visible),
-        /// and label its individual items so its contents become readable in place.
-        func focusSubdir(_ platform: SCNNode) {
-            focusedSubdir = platform
-
-            let platformBox = platform.geometry as? SCNBox
-            let platformWidth = platformBox?.width ?? SceneBuilder.cellSize
-
-            // Labels are baked into the platform itself (in SceneBuilder.makeSubdirNode)
-            // so this used to also add them on focus — that's redundant now. Just
-            // fly the camera.
-            flyToFrame(
-                center: platform.worldPosition,
-                halfExtent: platformWidth / 2,
-                duration: 0.55,
-                tight: true
-            )
         }
 
         private func clearFocusLabels() {
@@ -628,32 +668,6 @@ struct SceneHostView: NSViewRepresentable {
             return shape
         }
 
-        /// Half the step (one cell) of the grid containing `target`. Used to
-        /// clamp the spot light's outer-cone radius so the pool can't reach a
-        /// neighbor. Mini items get their parent's mini-grid step; root items
-        /// get the level's `gridStep` (stashed on the level node by
-        /// `SceneBuilder.makeLevelNode`).
-        private func gridCellHalfExtent(for target: SCNNode) -> CGFloat {
-            if let parent = target.parent, parent.name == "pedestal:subdir",
-               let parentBox = parent.geometry as? SCNBox {
-                let siblings = parent.childNodes.filter {
-                    $0.name == "file" || $0.name == "pedestal:subdir"
-                }
-                let cols = max(1, Int(ceil(sqrt(Double(max(siblings.count, 1))))))
-                let step = parentBox.width * SceneBuilder.subdirUsableFactor / CGFloat(cols)
-                return step / 2 * 1.2
-            }
-            var n: SCNNode? = target
-            while let cur = n {
-                if cur.name == "level",
-                   let stepNum = cur.value(forKey: "gridStep") as? NSNumber {
-                    return CGFloat(stepNum.doubleValue) / 2 * 1.2
-                }
-                n = cur.parent
-            }
-            return .greatestFiniteMagnitude
-        }
-
         /// Position the volumetric cone with its narrow apex at the spotlight
         /// source and its wide base on the item's *top* surface (not the floor).
         /// Critical: if the cone reached the floor it would overlap the corona
@@ -806,7 +820,7 @@ struct SceneHostView: NSViewRepresentable {
 
             if let node = findNode(forPath: req.url.path) {
                 if node.name == "pedestal:subdir" {
-                    enterSubdir(node, url: req.url)
+                    enterSubdir(url: req.url)
                 } else {
                     flyToFrame(
                         center: node.worldPosition,
@@ -822,15 +836,10 @@ struct SceneHostView: NSViewRepresentable {
             viewModel.descend(into: directoryToReRoot(for: req.url))
         }
 
-        /// Enter a subfolder: focus it in place if its contents are rendered, otherwise
-        /// re-root (which adds it as a new layer below the parent).
-        private func enterSubdir(_ node: SCNNode, url: URL?) {
-            let hasContents = node.childNodes.contains { $0.name == "file" || $0.name == "pedestal:subdir" }
-            if hasContents {
-                focusSubdir(node)
-            } else if let url {
-                viewModel.descend(into: url)
-            }
+        /// Enter a subfolder by re-rooting it as a new layer below the parent.
+        /// Folder contents aren't rendered inline, so this always descends.
+        private func enterSubdir(url: URL?) {
+            if let url { viewModel.descend(into: url) }
         }
 
         /// Resolve a URL to the directory we should re-root to: the URL itself if it's
@@ -874,15 +883,19 @@ struct SceneHostView: NSViewRepresentable {
             let pitch = 32.0 * .pi / 180.0
             let cosP = cos(pitch), sinP = sin(pitch)
 
-            // Grid is (roughly) square in the XZ plane; the corner sits at
-            // halfExtent·√2 from center. Add the tallest block + a little slack.
-            // In `tight` (single-item focus) mode we skip the grid-size floor and
-            // shrink the slack — both exist to keep an entire grid in frame and
-            // they vastly over-fit a single 1.4-wide file slab, which is why a
-            // selection used to land ~8 units back instead of dollying in close.
+            // Grid is (roughly) square in the XZ plane. A full bounding-sphere fit
+            // (radius = halfExtent·√2, the diagonal) is safe but overshoots: at the
+            // fixed 32° overview pitch the square's on-screen footprint is governed
+            // by its half-width, not its diagonal, so √2 left a ton of dead margin.
+            // We fit a tighter radius (≈ half-width + a little) for the overview,
+            // which still contains a square-ish grid at this pitch. The `tight`
+            // (single-item focus) path keeps the conservative sphere fit — it dollies
+            // onto one small slab where over-fitting would read as "floating".
+            // In `tight` mode we also skip the grid-size floor and shrink the slack.
+            let cornerFactor = tight ? sqrt(2.0) : 1.12
             let ext = tight ? Double(halfExtent) : Double(max(halfExtent, 1.5))
-            let slack = tight ? 0.2 : 1.0
-            let radius = sqrt(2.0) * ext + slack
+            let slack = tight ? 0.2 : 0.4
+            let radius = cornerFactor * ext + slack
 
             // Determine the binding (smaller) half-FOV from the camera + aspect.
             var halfFov = (55.0 * .pi / 180.0) / 2.0
@@ -906,7 +919,7 @@ struct SceneHostView: NSViewRepresentable {
             // plus margin so content isn't edge-to-edge. Tight mode fits the sphere
             // exactly (margin 1.0) so the item is as large as it can be without
             // clipping at the frame edges.
-            let margin = tight ? 1.0 : 1.18
+            let margin = tight ? 1.0 : 1.05
             let L = (radius / sin(max(halfFov, 0.01))) * margin
 
             return (L * cosP, L * sinP)
@@ -1001,12 +1014,10 @@ struct SceneHostView: NSViewRepresentable {
                     viewModel.descend(into: url)
                 }
             } else if target.name == "pedestal:subdir" {
-                // Single click on a folder flies INTO it without rebuilding the scene,
-                // so the parent grid stays around you (FSN's continuous space), and
-                // labels its items so the contents are readable in place. Folders whose
-                // contents aren't rendered (nested tiles) re-root instead.
+                // Single click on a folder descends into it (its contents aren't
+                // rendered inline — descending re-roots it as a new layer).
                 viewModel.select(url)
-                enterSubdir(target, url: url)
+                enterSubdir(url: url)
             } else {
                 // Single click on a file selects it and frames it with the camera
                 // (same angle as everything else), dollied in close FSN-style so

@@ -15,8 +15,16 @@ final class BrowserViewModel: ObservableObject {
     @Published var selectedURL: URL?
     /// The item currently under the cursor in the 3D view (HUD falls back to this).
     @Published var hoveredURL: URL?
-    /// True while a directory scan is in flight (drives the toolbar spinner).
+    /// True while a directory scan is in flight (drives the toolbar spinner and
+    /// the full-canvas loading overlay).
     @Published var isScanning: Bool = false
+    /// Name of the folder currently being scanned, shown on the loading overlay.
+    @Published var scanningTitle: String?
+    /// True while the 3D scene for the freshly-scanned folder is being built off
+    /// the main thread. Keeps the loading overlay up through the build so the wait
+    /// reads as one continuous "loading" instead of scan → freeze → pop-in. The
+    /// scene coordinator clears it once the level is attached.
+    @Published var isPreparingScene: Bool = false
     /// Last scan error message, if any.
     @Published var lastError: String?
 
@@ -140,7 +148,9 @@ final class BrowserViewModel: ObservableObject {
         navGeneration += 1
         let generation = navGeneration
         isScanning = true
+        scanningTitle = url.lastPathComponent
         lastError = nil
+        var didLoad = false
         do {
             let node = try await FileSystemScanner.scan(root: url, maxDepth: max(sidebarMaxDepth, sceneMaxDepth))
             guard generation == navGeneration else { return }   // superseded
@@ -149,11 +159,19 @@ final class BrowserViewModel: ObservableObject {
             history = [url]
             selectedURL = nil
             hoveredURL = nil
+            isPreparingScene = true   // hand off to the off-main scene build
+            didLoad = true
         } catch {
             guard generation == navGeneration else { return }
             lastError = error.localizedDescription
         }
-        if generation == navGeneration { isScanning = false }
+        // Drop the scan flag together with `isPreparingScene` so the overlay never
+        // flickers off between the scan finishing and the build starting. On a
+        // successful load the build phase (the scene coordinator) clears the title.
+        if generation == navGeneration {
+            isScanning = false
+            if !didLoad { scanningTitle = nil }
+        }
     }
 
     /// Scan `url` shallowly, make it the current 3D root, and update history per `mode`.
@@ -162,7 +180,9 @@ final class BrowserViewModel: ObservableObject {
         navGeneration += 1
         let generation = navGeneration
         isScanning = true
+        scanningTitle = url.lastPathComponent
         lastError = nil
+        var didLoad = false
         do {
             let node = try await FileSystemScanner.scan(root: url, maxDepth: sceneMaxDepth)
             guard generation == navGeneration else { return }   // superseded by a newer navigation
@@ -170,11 +190,16 @@ final class BrowserViewModel: ObservableObject {
             selectedURL = nil
             hoveredURL = nil
             applyHistory(mode, url: url)
+            isPreparingScene = true   // hand off to the off-main scene build
+            didLoad = true
         } catch {
             guard generation == navGeneration else { return }
             lastError = error.localizedDescription
         }
-        if generation == navGeneration { isScanning = false }
+        if generation == navGeneration {
+            isScanning = false
+            if !didLoad { scanningTitle = nil }
+        }
     }
 
     // MARK: - Sidebar interaction
