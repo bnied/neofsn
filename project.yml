@@ -38,6 +38,17 @@ targets:
         LD_RUNPATH_SEARCH_PATHS:
           - $(inherited)
           - "@executable_path/../Frameworks"
+  neofsnTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: neofsnTests
+    dependencies:
+      - target: neofsn
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bnied.neofsnTests
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   neofsn:
     build:
@@ -45,6 +56,11 @@ schemes:
         neofsn: all
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - neofsnTests
+      gatherCoverageData: true
     profile:
       config: Release
     analyze:
