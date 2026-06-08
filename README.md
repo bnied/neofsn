@@ -31,14 +31,31 @@ A spatial filesystem navigator for macOS — a modern homage to SGI's **FSN** (t
 ## Requirements
 
 - macOS 14.0 (Sonoma) or later — this is the app's minimum deployment target
-- Xcode 26 or later to build (the project uses file-system–synchronized groups)
+- Xcode 26 or later and [XcodeGen](https://github.com/yonaskolb/XcodeGen) to build (the `.xcodeproj` is generated from `project.yml`)
 
 ## Building
 
-Open `neofsn.xcodeproj` in Xcode and build, or from the command line:
+The Xcode project is generated from `project.yml` with [XcodeGen](https://github.com/yonaskolb/XcodeGen). Install it once, then generate the project:
+
+```sh
+brew install xcodegen
+xcodegen generate
+```
+
+Then open `neofsn.xcodeproj` in Xcode and build, or from the command line:
 
 ```sh
 xcodebuild -project neofsn.xcodeproj -scheme neofsn -configuration Debug build
+```
+
+`project.yml` is the source of truth; `neofsn.xcodeproj` is generated and not tracked in git. Re-run `xcodegen generate` after pulling changes that touch `project.yml`.
+
+## Testing
+
+Unit tests for the model layer live in `neofsnTests/` (Swift Testing). Run them with:
+
+```sh
+xcodebuild -project neofsn.xcodeproj -scheme neofsn -destination 'platform=macOS' test
 ```
 
 ## Running
@@ -101,7 +118,7 @@ scripts/
 
 ## Tooling notes
 
-The project is a hand-authored `.xcodeproj` (no SwiftPM manifest). For editors that use `sourcekit-lsp`, run `scripts/gen-compile-commands.sh` to generate a `compile_commands.json` so cross-file symbols resolve. The build itself always goes through `xcodebuild` / Xcode.
+The project is generated from `project.yml` via XcodeGen (the `.xcodeproj` is not committed). For editors that use `sourcekit-lsp`, run `scripts/gen-compile-commands.sh` to generate a `compile_commands.json` so cross-file symbols resolve. The build itself always goes through `xcodebuild` / Xcode.
 
 ## Acknowledgements
 
