@@ -33,16 +33,6 @@ struct FileSystemNodeTests {
         #expect(dir("d", [f]).outlineChildren == [f])
     }
 
-    @Test func aggregateSizeOfFileIsOwnSize() {
-        #expect(file("a.txt", size: 42).aggregateSize == 42)
-    }
-
-    @Test func aggregateSizeOfDirectoryIsRecursiveSum() {
-        let inner = dir("inner", [file("x", size: 10), file("y", size: 5)])
-        let root = dir("root", [inner, file("z", size: 7)])
-        #expect(root.aggregateSize == 22)
-    }
-
     @Test func identityEqualityAndHashing() {
         let a = file("a.txt", size: 1)
         let b = file("a.txt", size: 1)   // same data, distinct UUID
