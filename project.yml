@@ -7,6 +7,9 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
+    # Surface data races as warnings now (e.g. background scene builds reading
+    # main-actor state) and ease an eventual Swift 6 migration.
+    SWIFT_STRICT_CONCURRENCY: complete
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     DEAD_CODE_STRIPPING: YES
   configs:
