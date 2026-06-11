@@ -65,6 +65,18 @@ final class BrowserViewModel: ObservableObject {
     /// navigation, and overlapping scans don't drop the spinner early.
     private var navGeneration = 0
 
+    /// The in-flight load, kept so a newer navigation can cancel its scan (the
+    /// generation guard already discards stale *results*; cancelling stops the
+    /// superseded scan from wasting I/O on large trees).
+    private var loadTask: Task<Void, Never>?
+
+    /// Remembers the last opened folder across launches (security-scoped bookmark).
+    private let bookmark: LastFolderBookmark
+
+    init(bookmark: LastFolderBookmark = LastFolderBookmark()) {
+        self.bookmark = bookmark
+    }
+
     private let sidebarMaxDepth = 3
     private let sceneMaxDepth = 3
 
@@ -82,22 +94,40 @@ final class BrowserViewModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.prompt = "Visualize"
         panel.message = "Choose a folder to visualize"
-        if panel.runModal() == .OK, let url = panel.url {
-            Task { await loadInitial(url: url) }
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in self?.loadFolder(url) }
         }
     }
 
+    /// If no folder is open yet, restore the one from the previous session via its
+    /// security-scoped bookmark. Called once when the main view appears.
+    func restoreLastFolder() {
+        guard sidebarRoot == nil, !isScanning, let url = bookmark.restore() else { return }
+        loadFolder(url)
+    }
+
+    /// Load `url` as a fresh root (resetting history and the 3D level stack) and
+    /// remember it for the next launch. Returns the load task so callers (tests)
+    /// can await completion; UI call sites ignore it.
+    @discardableResult
+    func loadFolder(_ url: URL) -> Task<Void, Never> {
+        startLoad { await self.loadInitial(url: url) }
+    }
+
     /// Make `url` the current 3D root (re-roots / pushes a layer). Pushed onto history.
-    func descend(into url: URL) {
-        Task { await loadCurrent(url: url, history: .push) }
+    @discardableResult
+    func descend(into url: URL) -> Task<Void, Never> {
+        startLoad { await self.loadCurrent(url: url, history: .push) }
     }
 
     /// Navigate to an arbitrary folder (e.g. a breadcrumb segment or the back-up
     /// tile). If `url` is already in history (an ancestor we came through) the
     /// forward entries are truncated; otherwise it's appended — so Back keeps meaning
     /// "the previous folder" instead of growing the stack with duplicates.
-    func navigate(to url: URL) {
-        Task { await loadCurrent(url: url, history: .jump) }
+    @discardableResult
+    func navigate(to url: URL) -> Task<Void, Never> {
+        startLoad { await self.loadCurrent(url: url, history: .jump) }
     }
 
     /// The originally-opened folder — navigation is clamped at or below this, since
@@ -105,17 +135,28 @@ final class BrowserViewModel: ObservableObject {
     var openedRootURL: URL? { sidebarRoot?.url }
 
     /// Step back to the previously-visited folder in history.
-    func goBack() {
-        guard history.count > 1 else { return }
+    @discardableResult
+    func goBack() -> Task<Void, Never> {
+        guard history.count > 1 else { return Task {} }
         // Target the entry before the current one; `.jump` truncates history to it.
         let target = history[history.count - 2]
-        Task { await loadCurrent(url: target, history: .jump) }
+        return startLoad { await self.loadCurrent(url: target, history: .jump) }
     }
 
     /// Re-scan and reload the current folder in place (history unchanged).
-    func reload() {
-        guard let url = currentURL else { return }
-        Task { await loadCurrent(url: url, history: .keep) }
+    @discardableResult
+    func reload() -> Task<Void, Never> {
+        guard let url = currentURL else { return Task {} }
+        return startLoad { await self.loadCurrent(url: url, history: .keep) }
+    }
+
+    /// Cancel any in-flight load's scan and start a new one. The cancelled load
+    /// exits via its CancellationError path without touching published state.
+    private func startLoad(_ operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
+        loadTask?.cancel()
+        let task = Task { await operation() }
+        loadTask = task
+        return task
     }
 
     // MARK: - Loading
@@ -161,6 +202,9 @@ final class BrowserViewModel: ObservableObject {
             hoveredURL = nil
             isPreparingScene = true   // hand off to the off-main scene build
             didLoad = true
+            bookmark.save(url)        // reopen this folder on next launch
+        } catch is CancellationError {
+            return   // superseded before the generation even bumped — change nothing
         } catch {
             guard generation == navGeneration else { return }
             lastError = error.localizedDescription
@@ -192,6 +236,8 @@ final class BrowserViewModel: ObservableObject {
             applyHistory(mode, url: url)
             isPreparingScene = true   // hand off to the off-main scene build
             didLoad = true
+        } catch is CancellationError {
+            return   // superseded before the generation even bumped — change nothing
         } catch {
             guard generation == navGeneration else { return }
             lastError = error.localizedDescription

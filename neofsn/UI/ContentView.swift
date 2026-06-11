@@ -34,6 +34,10 @@ struct ContentView: View {
             previewSelected()
             return .handled
         }
+        .task {
+            // Reopen the previous session's folder (security-scoped bookmark).
+            viewModel.restoreLastFolder()
+        }
     }
 
     private var detailContent: some View {
