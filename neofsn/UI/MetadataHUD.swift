@@ -8,10 +8,34 @@ struct MetadataHUD: View {
 
     @ObservedObject var viewModel: BrowserViewModel
 
+    /// Last loaded metadata, kept alongside the URL it describes. Loading runs in
+    /// `.task(id:)` below — never in `body` — because reading attributes (and a
+    /// directory's full child list) is disk I/O that would otherwise re-run
+    /// synchronously on the main thread every render, once per hovered item.
+    @State private var loaded: (url: URL, info: Info)?
+
     var body: some View {
-        if let url = viewModel.actionableURL,
-           let info = readInfo(for: url) {
-            HStack(alignment: .top, spacing: 0) {
+        Group {
+            if let loaded {
+                panel(info: loaded.info, url: loaded.url)
+            }
+        }
+        .task(id: viewModel.actionableURL) {
+            guard let url = viewModel.actionableURL else {
+                loaded = nil
+                return
+            }
+            // Off the main thread; while it loads, the previous item's panel
+            // stays up so rapid hovering doesn't flicker the HUD.
+            let info = await Task.detached(priority: .userInitiated) { Self.readInfo(for: url) }.value
+            guard !Task.isCancelled else { return }   // a newer URL took over
+            loaded = info.map { (url, $0) }
+        }
+    }
+
+    @ViewBuilder
+    private func panel(info: Info, url: URL) -> some View {
+        HStack(alignment: .top, spacing: 0) {
                 specimen(info: info, url: url)
                     .padding(.trailing, 14)
 
@@ -39,7 +63,6 @@ struct MetadataHUD: View {
             .padding(.vertical, 11)
             .fixedSize(horizontal: false, vertical: true)
             .instrumentPanel()
-        }
     }
 
     @ViewBuilder
@@ -199,16 +222,24 @@ struct MetadataHUD: View {
             return r + w + x
         }
 
-        private func format(_ date: Date?) -> String {
-            guard let date else { return "—" }
+        /// Shared formatter — building a DateFormatter is expensive, and `format`
+        /// runs in the render path.
+        private static let dateFormatter: DateFormatter = {
             let f = DateFormatter()
             f.dateFormat = "MMM d, yyyy"
-            return f.string(from: date)
+            return f
+        }()
+
+        private func format(_ date: Date?) -> String {
+            guard let date else { return "—" }
+            return Self.dateFormatter.string(from: date)
         }
     }
 
-    /// Read the displayed attributes for `url` from disk, or nil if it can't be read.
-    private func readInfo(for url: URL) -> Info? {
+    /// Read the displayed attributes for `url` from disk, or nil if it can't be
+    /// read. `nonisolated` on purpose: it's blocking I/O, called from a detached
+    /// task — never from the main actor.
+    private nonisolated static func readInfo(for url: URL) -> Info? {
         let keys: [URLResourceKey] = [
             .isDirectoryKey, .fileSizeKey, .totalFileAllocatedSizeKey,
             .contentModificationDateKey, .creationDateKey, .nameKey,

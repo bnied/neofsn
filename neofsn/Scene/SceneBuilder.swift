@@ -36,10 +36,6 @@ enum ColorMode: String, CaseIterable {
 
 enum SceneBuilder {
 
-    /// Color strategy used by the next `makeLevelNode(root:)`. The Coordinator
-    /// sets this just before rebuilding so the chosen mode flows into every slab.
-    static var colorMode: ColorMode = .age
-
     // Cell sizing for the unified grid (each grid cell holds either a file or a subdir-island).
     // `cellSpacing` is the GAP between adjacent items, not "step − size", so a
     // level with a 5.0-wide subdir platform and a narrow file slab still spaces
@@ -79,9 +75,14 @@ enum SceneBuilder {
     /// the folder's items laid out on top. The node is centered at its own origin
     /// (the floor's top surface is at local y = 0); the caller positions it in the
     /// stack. Returns the node and the grid's half-extent for camera framing.
+    ///
+    /// `colorMode` is an explicit parameter (not shared state) because this runs
+    /// on a background task — the caller captures the mode at dispatch time, so a
+    /// toggle mid-build can't produce a mixed-palette level.
     static func makeLevelNode(
         root: FileSystemNode,
-        parentURL: URL? = nil
+        parentURL: URL? = nil,
+        colorMode: ColorMode
     ) -> (node: SCNNode, halfExtent: CGFloat, hasBack: Bool) {
         let level = SCNNode()
         level.name = "level"
@@ -123,7 +124,7 @@ enum SceneBuilder {
             case .subdir(let n):
                 view = makeSubdirNode(subdir: n)
             case .file(let n):
-                view = makeFileNode(file: n, baseWidth: fileBaseWidth, maxHeight: fileMaxHeight)
+                view = makeFileNode(file: n, baseWidth: fileBaseWidth, maxHeight: fileMaxHeight, colorMode: colorMode)
             }
             view.position = SCNVector3(x, view.position.y, z)
             level.addChildNode(view)
@@ -250,9 +251,9 @@ enum SceneBuilder {
 
     /// One file = a flat slab (wider than tall). The slab IS the named interactive node
     /// so hover/click highlight works directly on its material. An icon plane sits on top.
-    private static func makeFileNode(file: FileSystemNode, baseWidth: CGFloat, maxHeight: CGFloat) -> SCNNode {
+    private static func makeFileNode(file: FileSystemNode, baseWidth: CGFloat, maxHeight: CGFloat, colorMode: ColorMode) -> SCNNode {
         let height = slabHeight(forSize: file.size, max: maxHeight)
-        let color = colorForFile(file)
+        let color = colorForFile(file, mode: colorMode)
 
         let geom = SCNBox(width: baseWidth, height: height, length: baseWidth, chamferRadius: 0.03)
         let mat = SCNMaterial()
@@ -484,7 +485,7 @@ enum SceneBuilder {
 
     /// Trim `text` with a trailing ellipsis until its rendered aspect ratio
     /// (width ÷ height) no longer exceeds `maxAspect`.
-    private static func truncateToAspect(
+    static func truncateToAspect(
         text: String, attrs: [NSAttributedString.Key: Any], maxAspect: CGFloat
     ) -> String {
         let measure: (String) -> CGFloat = { candidate in
@@ -531,15 +532,15 @@ enum SceneBuilder {
     // MARK: - Size + age
 
     /// Map a file's byte size to a slab height on a log scale, clamped to `maxH`.
-    private static func slabHeight(forSize size: Int64, max maxH: CGFloat) -> CGFloat {
+    static func slabHeight(forSize size: Int64, max maxH: CGFloat) -> CGFloat {
         let clamped = Swift.max(1, Double(size))
         let h = log10(clamped) * 0.05
         return CGFloat(Swift.min(Double(maxH), Swift.max(0.07, h)))
     }
 
-    /// Dispatch to the active color strategy for this slab.
-    private static func colorForFile(_ file: FileSystemNode) -> NSColor {
-        switch colorMode {
+    /// Dispatch to the requested color strategy for this slab.
+    private static func colorForFile(_ file: FileSystemNode, mode: ColorMode) -> NSColor {
+        switch mode {
         case .age:
             return colorForAge(modified: file.modificationDate)
         case .type:
@@ -547,9 +548,9 @@ enum SceneBuilder {
         }
     }
 
-    /// Walk every "file" slab under `root` and reapply its diffuse color using the
-    /// currently-set `colorMode`. Folder platforms (gold) are not affected.
-    static func recolorFileSlabs(under root: SCNNode) {
+    /// Walk every "file" slab under `root` and reapply its diffuse color using
+    /// `colorMode`. Folder platforms (gold) are not affected.
+    static func recolorFileSlabs(under root: SCNNode, colorMode: ColorMode) {
         root.enumerateChildNodes { node, _ in
             guard node.name == "file",
                   let mat = node.geometry?.firstMaterial,
@@ -565,7 +566,9 @@ enum SceneBuilder {
         }
     }
 
-    /// FSN-style age heatmap.
+    /// FSN-style age heatmap. "Now" is sampled at build time, so colors can drift
+    /// a band if the app stays open across a boundary — acceptable: the coarsest
+    /// band is a week, and any navigation or reload rebuilds with fresh colors.
     private static func colorForAge(modified: Date?) -> NSColor {
         guard let modified else {
             return NSColor(calibratedWhite: 0.5, alpha: 1)
@@ -584,7 +587,9 @@ enum SceneBuilder {
 
     // MARK: - SF Symbol → tinted NSImage cache
 
-    private static let symbolCache = NSCache<NSString, NSImage>()
+    /// `nonisolated(unsafe)`: NSCache is documented thread-safe, and levels are
+    /// built from concurrent background tasks that all share this cache.
+    nonisolated(unsafe) private static let symbolCache = NSCache<NSString, NSImage>()
 
     /// Render an SF Symbol to a flat tinted bitmap (cached) for use as a plane texture.
     private static func renderSFSymbol(_ name: String, tint: NSColor, pointSize: CGFloat = 96) -> NSImage? {
@@ -650,9 +655,9 @@ private extension NSColor {
         guard let rgb = usingColorSpace(.deviceRGB) else { return "x" }
         return String(
             format: "%02x%02x%02x",
-            Int(rgb.redComponent * 255),
-            Int(rgb.greenComponent * 255),
-            Int(rgb.blueComponent * 255)
+            Int((rgb.redComponent * 255).rounded()),
+            Int((rgb.greenComponent * 255).rounded()),
+            Int((rgb.blueComponent * 255).rounded())
         )
     }
 }

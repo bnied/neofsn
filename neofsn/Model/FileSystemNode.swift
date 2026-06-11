@@ -13,7 +13,7 @@ final class FileSystemNode: Identifiable, Hashable, @unchecked Sendable {
     let isDirectory: Bool
     let size: Int64
     let modificationDate: Date?
-    var children: [FileSystemNode]
+    let children: [FileSystemNode]
     /// False if this directory existed but its contents couldn't be read (e.g.
     /// permission denied), so the UI can distinguish "empty" from "unreadable".
     let isReadable: Bool
@@ -55,10 +55,5 @@ final class FileSystemNode: Identifiable, Hashable, @unchecked Sendable {
     /// OutlineGroup contract: nil = leaf (no chevron); empty array = expandable but currently empty.
     var outlineChildren: [FileSystemNode]? {
         isDirectory ? children : nil
-    }
-
-    /// Total size of this node: a file's own size, or the recursive sum for a directory.
-    var aggregateSize: Int64 {
-        isDirectory ? children.reduce(0) { $0 + $1.aggregateSize } : size
     }
 }

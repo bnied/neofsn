@@ -39,6 +39,23 @@ struct FileSystemScannerTests {
         #expect(node.children.map(\.name) == ["visible.txt"])
     }
 
+    @Test func treatsPackagesAsLeafFiles() async throws {
+        let tmp = try TempDir()
+        try tmp.makeFile("Demo.app/Contents/Info.plist")
+        let node = try await FileSystemScanner.scan(root: tmp.url, maxDepth: 3)
+        let app = try #require(node.children.first { $0.name == "Demo.app" })
+        #expect(app.isDirectory == false)   // packages render as leaves, like Finder
+        #expect(app.children.isEmpty)       // never descended into
+    }
+
+    @Test func cancelledScanThrowsCancellationError() async throws {
+        let tmp = try TempDir()
+        try tmp.makeFile("a.txt")
+        let task = Task { try await FileSystemScanner.scan(root: tmp.url, maxDepth: 2) }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+    }
+
     @Test func unreadableDirectoryIsMarkedUnreadable() async throws {
         let tmp = try TempDir()
         let locked = try tmp.makeDir("locked")

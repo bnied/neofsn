@@ -20,7 +20,7 @@ final class FlyCameraController {
     private let damping: Double = 9
     private let scrollSpeed: Double = 0.45
 
-    private var displayTimer: Timer?
+    private var displayLink: CADisplayLink?
     private var lastTick: CFTimeInterval = 0
     private var boost: Bool = false
 
@@ -38,22 +38,36 @@ final class FlyCameraController {
 
     // MARK: - Run loop
 
-    /// Start the 60 Hz update loop that integrates keyboard movement.
-    func start() {
-        guard displayTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.tick()
-            }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        displayTimer = timer
+    /// Start the per-frame update loop that integrates keyboard movement. A
+    /// view-attached `CADisplayLink` (not a fixed 60 Hz Timer) so ticks are
+    /// synced to the actual display refresh (120 Hz on ProMotion). The link
+    /// starts paused — it only runs while there is movement to integrate, so an
+    /// idle scene costs nothing (see `wake()` / the pause check in `tick()`).
+    func start(in view: NSView) {
+        guard displayLink == nil else { return }
+        let link = view.displayLink(target: self, selector: #selector(step))
+        link.isPaused = true
+        link.add(to: .main, forMode: .common)
+        displayLink = link
     }
 
     /// Stop the update loop (call when the hosting view goes away).
     func stop() {
-        displayTimer?.invalidate()
-        displayTimer = nil
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
+    /// Display-link callback; delivered on the main run loop.
+    @objc private func step(_ link: CADisplayLink) {
+        tick()
+    }
+
+    /// Resume per-frame ticking (movement input arrived). Resets the tick clock
+    /// so the first integration step after a pause uses a sane dt.
+    private func wake() {
+        guard let link = displayLink, link.isPaused else { return }
+        lastTick = 0
+        link.isPaused = false
     }
 
     // MARK: - Public reset
@@ -136,6 +150,7 @@ final class FlyCameraController {
             // Movement keys take over from any in-flight framing animation.
             if heldKeys.isEmpty { cancelFlight() }
             heldKeys.insert(code)
+            wake()
             return true
         }
         return false
@@ -235,6 +250,11 @@ final class FlyCameraController {
                 CGFloat(Double(pos.y) + velocity.y * dt),
                 CGFloat(Double(pos.z) + velocity.z * dt)
             )
+        } else if heldKeys.isEmpty {
+            // Nothing held and motion has fully decayed — stop ticking (and with
+            // it, continuous re-rendering) until the next movement input.
+            velocity = .zero
+            displayLink?.isPaused = true
         }
     }
 

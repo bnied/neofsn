@@ -1,0 +1,26 @@
+# Build + test on every push/PR.
+#
+# NOTE: Codeberg's hosted Forgejo runners are Linux-only, and this project needs
+# macOS + Xcode. Register a self-hosted Forgejo runner on a Mac with the label
+# `macos` for this workflow to pick up jobs:
+#   https://forgejo.org/docs/latest/admin/actions/
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build and test
+        run: |
+          xcodebuild -project neofsn.xcodeproj -scheme neofsn \
+            -destination 'platform=macOS' test

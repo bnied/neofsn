@@ -6,9 +6,9 @@
 
 > **Status: beta.** neofsn is under active development. Expect rough edges, changing behavior, and the occasional bug.
 >
-> **Requires macOS 14 (Sonoma) or later.**
+> **Requires macOS 15 (Sequoia) or later.**
 
-A spatial filesystem navigator for macOS — a modern homage to SGI's **FSN** (the "File System Navigator" famously shown as the 3D UNIX interface in *Jurassic Park*). Folders become blue platforms, files become flat slabs you fly through, and a warm volumetric spotlight marks whatever you've selected. Built with SwiftUI for the shell and SceneKit for the 3D scene.
+A spatial filesystem navigator for macOS — a modern homage to SGI's **FSN** (the "File System Navigator" famously shown as the 3D UNIX interface in *Jurassic Park*). Folders become blue platforms, files become flat slabs you fly through, and a warm pulsing halo marks whatever you've selected. Built with SwiftUI for the shell and SceneKit for the 3D scene.
 
 > *"It's a UNIX system. I know this."*
 
@@ -23,14 +23,15 @@ A spatial filesystem navigator for macOS — a modern homage to SGI's **FSN** (t
 - **Layered descent.** Stepping into a subfolder drops a new plate beside-and-below the current one and pans the camera to it — the parent stays on screen, so you keep your bearings instead of losing context to a full redraw.
 - **Hierarchical sidebar** mirroring the tree, with two-way sync: pick something in 3D and the sidebar scrolls to it; click in the sidebar and the camera flies to it.
 - **Interactive breadcrumb bar** — jump to any ancestor folder with a click.
-- **FSN-style selection spotlight.** The selected item gets a translucent warm volumetric cone of light descending from above, a glowing halo on the floor around its base, and a subtle illumination on the item itself — the app's signature visual.
+- **Selection halo.** The selected item gets a soft warm-gold ring of light around its base, gently pulsing — the app's signature visual.
+- **Remembers your last folder.** The opened folder is persisted as a security-scoped bookmark and reopened automatically on the next launch.
 - **Expanded metadata HUD** with kind chip, name, full path, size (or file/subdir count for folders), modified/created dates, permissions (`rwx`), and age — plus an inline action strip: Quick Look, Open, Copy Path (`⇧⌘C`), Reveal in Finder, and Descend (for folders).
 - **Finder integration & Quick Look** — open in the default app (`⇧⌘O`), reveal in Finder (`⌘R`), copy path (`⇧⌘C`), or press `Space` to Quick Look the selection.
 - **Reset view** (`⌘0`, the scope button, or click empty space) re-frames the current folder.
 
 ## Requirements
 
-- macOS 14.0 (Sonoma) or later — this is the app's minimum deployment target
+- macOS 15.0 (Sequoia) or later — this is the app's minimum deployment target
 - Xcode 26 or later and [XcodeGen](https://github.com/yonaskolb/XcodeGen) to build (the `.xcodeproj` is generated from `project.yml`)
 
 ## Building
@@ -69,7 +70,7 @@ open "$(xcodebuild -project neofsn.xcodeproj -scheme neofsn -configuration Debug
   -showBuildSettings 2>/dev/null | awk '/ BUILT_PRODUCTS_DIR /{d=$3} END{print d}')/neofsn.app"
 ```
 
-On first launch the 3D view is empty. Click **Open…** (or press `⌘O`) and choose a folder to visualize. The app is sandboxed and uses security-scoped bookmarks, so it only ever reads the folders you explicitly pick. Once a folder is open, fly around with the keyboard and mouse (see below), click items to inspect them, and step into subfolders to descend.
+On first launch the 3D view is empty. Click **Open…** (or press `⌘O`) and choose a folder to visualize. The app is sandboxed and uses security-scoped bookmarks, so it only ever reads the folders you explicitly pick — and it remembers the last one, reopening it automatically on the next launch. Once a folder is open, fly around with the keyboard and mouse (see below), click items to inspect them, and step into subfolders to descend.
 
 ## Keyboard & mouse
 
@@ -94,22 +95,24 @@ On first launch the 3D view is empty. Click **Open…** (or press `⌘O`) and ch
 
 ```
 neofsn/
-├── neofsnApp.swift          # App entry point
-├── ContentView.swift        # NavigationSplitView shell, toolbar, breadcrumbs, empty state
-├── BrowserViewModel.swift   # Navigation state, scanning, selection, focus requests
-├── QuickLookPreview.swift   # QLPreviewPanel bridge
+├── neofsnApp.swift              # App entry point, window configuration
 ├── Model/
+│   ├── BrowserViewModel.swift   # Navigation state, scanning, selection, focus requests
 │   ├── FileKind.swift           # File-type taxonomy (icon symbols + type-mode palette)
 │   ├── FileSystemNode.swift     # Tree node model
-│   └── FileSystemScanner.swift  # Async directory scanner
+│   ├── FileSystemScanner.swift  # Async (cancellable) directory scanner
+│   └── LastFolderBookmark.swift # Security-scoped bookmark for the last opened folder
 ├── Scene/
 │   ├── SceneBuilder.swift       # Builds level plates, slabs, icons, labels
-│   ├── SceneHostView.swift      # SCNView host, level stack, picking, framing
+│   ├── SceneHostView.swift      # SCNView host, level stack, picking, framing, Quick Look
 │   └── FlyCameraController.swift# WASD/look/scroll fly camera
 └── UI/
+    ├── ContentView.swift        # NavigationSplitView shell, top bar, breadcrumbs, empty state
     ├── SidebarView.swift        # Hierarchical tree sidebar
     ├── MetadataHUD.swift        # Selected-item metadata panel
     └── Theme.swift              # Color, type, and panel design tokens
+
+neofsnTests/                     # Swift Testing unit tests for the model & scene math
 
 scripts/
 ├── generate-icon.swift          # Renders the app icon set
