@@ -27,13 +27,15 @@ struct SceneHostView: NSViewRepresentable {
         view.antialiasingMode = .multisampling4X
         view.preferredFramesPerSecond = 60
         view.backgroundColor = NSColor(calibratedRed: 0.035, green: 0.038, blue: 0.052, alpha: 1)
-        view.rendersContinuously = true
+        // Not `rendersContinuously`: SCNView re-renders on its own whenever the
+        // scene changes (camera moves, actions, transactions, material edits).
+        // Forcing continuous rendering would burn GPU/battery while idle.
         view.autoresizingMask = [.width, .height]
         view.coordinator = context.coordinator
         view.delegate = context.coordinator   // render-loop callback for overlay handoff
         context.coordinator.scnView = view
         context.coordinator.installEventMonitors()
-        context.coordinator.flyCamera.start()
+        context.coordinator.flyCamera.start(in: view)
         return view
     }
 
@@ -175,7 +177,6 @@ struct SceneHostView: NSViewRepresentable {
 
         func syncFromViewModel() {
             guard let root = viewModel.currentRoot else { return }
-            SceneBuilder.colorMode = viewModel.colorMode
 
             let colorChanged = viewModel.colorRebuildToken != lastColorRebuildToken
             let rootChanged = lastRootID != root.id
@@ -189,7 +190,7 @@ struct SceneHostView: NSViewRepresentable {
             // scene and reapply diffuse colors. Cheap, geometry stays put, the
             // camera frame is preserved.
             if colorChanged && !rootChanged {
-                SceneBuilder.recolorFileSlabs(under: scene.rootNode)
+                SceneBuilder.recolorFileSlabs(under: scene.rootNode, colorMode: viewModel.colorMode)
                 finishPreparing()
                 return
             }
@@ -234,9 +235,12 @@ struct SceneHostView: NSViewRepresentable {
             // Show the back control whenever there's a parent level to return to; fall
             // back to the navigable filesystem parent on a re-root (no parent level).
             let parentURL = parent?.url ?? navigableParentURL(for: root.url)
+            // Capture the color mode now, on the main actor — the detached build
+            // must not read view-model state from another thread.
+            let colorMode = viewModel.colorMode
             Task { [weak self] in
                 let built = await Task.detached(priority: .userInitiated) {
-                    SceneBuilder.makeLevelNode(root: root, parentURL: parentURL)
+                    SceneBuilder.makeLevelNode(root: root, parentURL: parentURL, colorMode: colorMode)
                 }.value
                 guard let self else { return }
                 guard let view = self.scnView else {
@@ -447,15 +451,20 @@ struct SceneHostView: NSViewRepresentable {
             scene.rootNode.addChildNode(wrapper)
             selectionRingNode = wrapper
             selectionRingInner = inner
+            // The pulse action starts when the ring is shown (`moveSpotlight`),
+            // not here: a repeat-forever action on a hidden ring would keep
+            // SceneKit re-rendering every frame even with nothing selected.
+        }
 
-            // Scale pulse only — no tilt animation. The X-tilt was rotating the
-            // flat halo so its front edge dipped under the plate's surface.
+        /// Scale pulse only — no tilt animation. The X-tilt was rotating the
+        /// flat halo so its front edge dipped under the plate's surface.
+        private static func makeRingPulse() -> SCNAction {
             let pulse = SCNAction.sequence([
                 SCNAction.scale(to: 1.05, duration: 0.9),
                 SCNAction.scale(to: 1.00, duration: 0.9),
             ])
             pulse.timingMode = .easeInEaseOut
-            inner.runAction(SCNAction.repeatForever(pulse))
+            return SCNAction.repeatForever(pulse)
         }
 
         /// Pre-rendered soft halo texture: a single sharp rounded-rect stroke
@@ -582,10 +591,16 @@ struct SceneHostView: NSViewRepresentable {
             wrapper.position = SCNVector3(world.x, baseY, world.z)
             wrapper.opacity = 0.95
             SCNTransaction.commit()
+
+            if inner.action(forKey: "pulse") == nil {
+                inner.runAction(Self.makeRingPulse(), forKey: "pulse")
+            }
         }
 
-        /// Ramp the selection ring to zero (parked).
+        /// Ramp the selection ring to zero (parked) and stop its pulse, so the
+        /// hidden ring doesn't keep the render loop alive.
         private func hideSpotlight() {
+            selectionRingInner?.removeAction(forKey: "pulse")
             SCNTransaction.begin()
             SCNTransaction.animationDuration = 0.20
             SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeIn)
@@ -727,8 +742,12 @@ struct SceneHostView: NSViewRepresentable {
             resignObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.didResignKeyNotification, object: nil, queue: .main
             ) { [weak self] note in
+                // Compare by identity token: ObjectIdentifier is Sendable, so the
+                // non-Sendable NSWindow itself never crosses into the actor hop.
+                let windowID = (note.object as? NSWindow).map(ObjectIdentifier.init)
                 MainActor.assumeIsolated {
-                    guard let self, note.object as? NSWindow === self.scnView?.window else { return }
+                    guard let self, let windowID,
+                          self.scnView?.window.map(ObjectIdentifier.init) == windowID else { return }
                     self.flyCamera.releaseAllKeys()
                 }
             }
@@ -1023,14 +1042,20 @@ final class InteractiveSCNView: SCNView {
     /// begin/end callbacks instead of poking the shared panel imperatively.
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
 
+    // The panel-control overrides are nonisolated in the SDK but AppKit only
+    // calls them on the main thread — `assumeIsolated` makes that explicit.
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
-        panel.dataSource = self
-        panel.delegate = self
+        MainActor.assumeIsolated {
+            panel.dataSource = self
+            panel.delegate = self
+        }
     }
 
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
-        if panel.dataSource === self { panel.dataSource = nil }
-        if panel.delegate === self { panel.delegate = nil }
+        MainActor.assumeIsolated {
+            if panel.dataSource === self { panel.dataSource = nil }
+            if panel.delegate === self { panel.delegate = nil }
+        }
     }
 
     /// Toggle the shared Quick Look panel. Becoming first responder first ensures
@@ -1060,7 +1085,9 @@ final class InteractiveSCNView: SCNView {
 
 // MARK: - Quick Look data source
 
-extension InteractiveSCNView: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+// `@preconcurrency`: the Quick Look protocols predate Swift concurrency; AppKit
+// drives them on the main thread, where this main-actor view already lives.
+extension InteractiveSCNView: @preconcurrency QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
         coordinator?.viewModel.actionableURL == nil ? 0 : 1
     }
