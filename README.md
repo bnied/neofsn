@@ -32,24 +32,17 @@ A spatial filesystem navigator for macOS — a modern homage to SGI's **FSN** (t
 ## Requirements
 
 - macOS 15.0 (Sequoia) or later — this is the app's minimum deployment target
-- Xcode 26 or later and [XcodeGen](https://github.com/yonaskolb/XcodeGen) to build (the `.xcodeproj` is generated from `project.yml`)
+- Xcode 26 or later to build. The `.xcodeproj` is committed, so you can open it directly. [XcodeGen](https://github.com/yonaskolb/XcodeGen) is only needed if you change `project.yml`.
 
 ## Building
 
-The Xcode project is generated from `project.yml` with [XcodeGen](https://github.com/yonaskolb/XcodeGen). Install it once, then generate the project:
-
-```sh
-brew install xcodegen
-xcodegen generate
-```
-
-Then open `neofsn.xcodeproj` in Xcode and build, or from the command line:
+Open `neofsn.xcodeproj` in Xcode and build, or from the command line:
 
 ```sh
 xcodebuild -project neofsn.xcodeproj -scheme neofsn -configuration Debug build
 ```
 
-`project.yml` is the source of truth; `neofsn.xcodeproj` is generated and not tracked in git. Re-run `xcodegen generate` after pulling changes that touch `project.yml`.
+`project.yml` is the source of truth for the project structure. The generated `neofsn.xcodeproj` is committed so a fresh checkout opens without extra setup. If you edit `project.yml`, run `xcodegen generate` (`brew install xcodegen` first) and commit the regenerated project alongside it.
 
 ## Testing
 
@@ -121,7 +114,7 @@ scripts/
 
 ## Tooling notes
 
-The project is generated from `project.yml` via XcodeGen (the `.xcodeproj` is not committed). For editors that use `sourcekit-lsp`, run `scripts/gen-compile-commands.sh` to generate a `compile_commands.json` so cross-file symbols resolve. The build itself always goes through `xcodebuild` / Xcode.
+The project structure is defined in `project.yml` and generated via XcodeGen; the resulting `.xcodeproj` is committed. For editors that use `sourcekit-lsp`, run `scripts/gen-compile-commands.sh` to generate a `compile_commands.json` so cross-file symbols resolve. The build itself always goes through `xcodebuild` / Xcode.
 
 ## Acknowledgements
 
