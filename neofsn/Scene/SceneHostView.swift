@@ -7,7 +7,7 @@ import Quartz
 /// (current root, focus/reset requests, selection) into the 3D scene via its Coordinator.
 struct SceneHostView: NSViewRepresentable {
 
-    @ObservedObject var viewModel: BrowserViewModel
+    var viewModel: BrowserViewModel
 
     /// Create the Coordinator that owns the scene, camera, and level stack.
     func makeCoordinator() -> Coordinator {

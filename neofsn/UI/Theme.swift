@@ -104,7 +104,6 @@ extension View {
         self
             .font(Theme.caps(9))
             .tracking(2.2)
-            .textCase(.uppercase)
             .foregroundStyle(color)
     }
 }

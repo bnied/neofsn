@@ -6,7 +6,7 @@ import AppKit
 /// is selected or hovered.
 struct MetadataHUD: View {
 
-    @ObservedObject var viewModel: BrowserViewModel
+    var viewModel: BrowserViewModel
 
     /// Last loaded metadata, kept alongside the URL it describes. Loading runs in
     /// `.task(id:)` below — never in `body` — because reading attributes (and a
@@ -44,13 +44,13 @@ struct MetadataHUD: View {
                 statBlock(label: info.sizeLabel, value: info.sizeText,
                           sub: info.sizeSub, width: 88)
                 vRule
-                statBlock(label: "modified", value: info.modifiedText,
+                statBlock(label: "MODIFIED", value: info.modifiedText,
                           sub: info.ageText, width: 102)
                 vRule
-                statBlock(label: "created", value: info.createdText,
+                statBlock(label: "CREATED", value: info.createdText,
                           sub: nil, width: 88)
                 vRule
-                statBlock(label: "perms", value: info.permsText,
+                statBlock(label: "PERMS", value: info.permsText,
                           sub: nil, width: 46)
 
                 vRule
@@ -81,7 +81,7 @@ struct MetadataHUD: View {
                 Image(systemName: info.kind.iconName)
                     .font(.system(size: 9))
                     .foregroundStyle(info.isDirectory ? Theme.folder : Theme.textSecondary)
-                Text(info.kindChipText).capsLabel(color: Theme.textTertiary)
+                Text(info.kindChipText.uppercased()).capsLabel(color: Theme.textTertiary)
             }
             Text(info.name)
                 .font(Theme.display(15, weight: .regular))
@@ -181,7 +181,7 @@ struct MetadataHUD: View {
 
         var kindChipText: String { kind.label }
 
-        var sizeLabel: String { isDirectory ? "items" : "size" }
+        var sizeLabel: String { isDirectory ? "ITEMS" : "SIZE" }
 
         var sizeText: String {
             if isDirectory {

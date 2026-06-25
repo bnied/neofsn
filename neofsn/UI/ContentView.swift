@@ -2,7 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
 
-    @StateObject private var viewModel = BrowserViewModel()
+    @State private var viewModel = BrowserViewModel()
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
 
     var body: some View {
@@ -121,7 +121,7 @@ private struct LoadingOverlay: View {
                     .scaleEffect(pulse ? 1.05 : 0.95)
 
                 VStack(spacing: 12) {
-                    Text("scanning filesystem")
+                    Text("SCANNING FILESYSTEM")
                         .capsLabel(color: Theme.textSecondary)
                         .tracking(3.5)
 
@@ -249,7 +249,7 @@ private struct EmptyStateView: View {
                 }
 
                 // Tagline
-                Text("a spatial filesystem navigator")
+                Text("A SPATIAL FILESYSTEM NAVIGATOR")
                     .capsLabel(color: Theme.textSecondary)
                     .tracking(3.5)
 
@@ -284,7 +284,7 @@ private struct EmptyStateView: View {
 // MARK: - Top bar
 
 private struct TopBar: View {
-    @ObservedObject var viewModel: BrowserViewModel
+    @Bindable var viewModel: BrowserViewModel
     @Binding var columnVisibility: NavigationSplitViewVisibility
 
     var body: some View {
@@ -320,7 +320,7 @@ private struct TopBar: View {
             if viewModel.isScanning {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
-                    Text("scanning")
+                    Text("SCANNING")
                         .capsLabel()
                 }
                 .transition(.opacity)
@@ -382,7 +382,7 @@ private struct TopBar: View {
 
 private struct PathBreadcrumbs: View {
     let url: URL
-    @ObservedObject var viewModel: BrowserViewModel
+    var viewModel: BrowserViewModel
 
     private struct Crumb: Identifiable {
         let id: Int
@@ -455,8 +455,8 @@ private struct ColorModeToggle: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            segment(label: "age", value: .age, help: "Color by modification age")
-            segment(label: "type", value: .type, help: "Color by file type")
+            segment(label: "AGE", value: .age, help: "Color by modification age")
+            segment(label: "TYPE", value: .type, help: "Color by file type")
         }
         .overlay(
             RoundedRectangle(cornerRadius: 3)
@@ -473,7 +473,6 @@ private struct ColorModeToggle: View {
             Text(label)
                 .font(Theme.caps(9))
                 .tracking(2.0)
-                .textCase(.uppercase)
                 .foregroundStyle(selected ? Theme.backdrop : Theme.textSecondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 5)

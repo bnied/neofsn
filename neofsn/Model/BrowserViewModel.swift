@@ -3,30 +3,31 @@ import SwiftUI
 import AppKit
 
 @MainActor
-final class BrowserViewModel: ObservableObject {
+@Observable
+final class BrowserViewModel {
 
     /// Tree shown in the sidebar — anchored to the originally-picked folder, scanned deeply.
-    @Published var sidebarRoot: FileSystemNode?
+    var sidebarRoot: FileSystemNode?
 
     /// Tree shown in the 3D scene — follows descent, scanned shallowly for snappy reloads.
-    @Published var currentRoot: FileSystemNode?
+    var currentRoot: FileSystemNode?
 
     /// The item the user explicitly clicked/selected (drives the HUD and the file tilt).
-    @Published var selectedURL: URL?
+    var selectedURL: URL?
     /// The item currently under the cursor in the 3D view (HUD falls back to this).
-    @Published var hoveredURL: URL?
+    var hoveredURL: URL?
     /// True while a directory scan is in flight (drives the toolbar spinner and
     /// the full-canvas loading overlay).
-    @Published var isScanning: Bool = false
+    var isScanning: Bool = false
     /// Name of the folder currently being scanned, shown on the loading overlay.
-    @Published var scanningTitle: String?
+    var scanningTitle: String?
     /// True while the 3D scene for the freshly-scanned folder is being built off
     /// the main thread. Keeps the loading overlay up through the build so the wait
     /// reads as one continuous "loading" instead of scan → freeze → pop-in. The
     /// scene coordinator clears it once the level is attached.
-    @Published var isPreparingScene: Bool = false
+    var isPreparingScene: Bool = false
     /// Last scan error message, if any.
-    @Published var lastError: String?
+    var lastError: String?
 
     /// A request for the 3D scene to fly its camera to a specific URL's node.
     /// The token disambiguates repeated requests for the same URL.
@@ -34,20 +35,20 @@ final class BrowserViewModel: ObservableObject {
         let url: URL
         let token: Int
     }
-    @Published private(set) var sceneFocusRequest: FocusRequest?
+    private(set) var sceneFocusRequest: FocusRequest?
     private var focusCounter = 0
 
     /// Incremented to ask the 3D scene to re-frame the whole current folder.
-    @Published private(set) var resetViewToken: Int = 0
+    private(set) var resetViewToken: Int = 0
     func requestResetView() { resetViewToken += 1 }
 
     /// Incremented to ask the 3D scene to toggle the Quick Look panel. The scene
     /// coordinator owns the panel so it can drive it through the responder chain.
-    @Published private(set) var quickLookToken: Int = 0
+    private(set) var quickLookToken: Int = 0
 
     /// Active strategy for coloring file slabs in the 3D scene. Changing this
     /// bumps `colorRebuildToken` so the scene rebuilds with the new palette.
-    @Published var colorMode: ColorMode = .age {
+    var colorMode: ColorMode = .age {
         didSet {
             guard oldValue != colorMode else { return }
             colorRebuildToken += 1
@@ -55,7 +56,7 @@ final class BrowserViewModel: ObservableObject {
     }
     /// Incremented when `colorMode` changes; the scene coordinator watches this
     /// to know it must rebuild the level stack with new materials.
-    @Published private(set) var colorRebuildToken: Int = 0
+    private(set) var colorRebuildToken: Int = 0
 
     private var history: [URL] = []
 

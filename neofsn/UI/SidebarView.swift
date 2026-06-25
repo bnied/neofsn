@@ -4,7 +4,7 @@ import SwiftUI
 /// sidebar. Clicking a row focuses it in the 3D view; selection scrolls into view.
 struct SidebarView: View {
 
-    @ObservedObject var viewModel: BrowserViewModel
+    var viewModel: BrowserViewModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -17,7 +17,7 @@ struct SidebarView: View {
 
     private var header: some View {
         HStack {
-            Text("filesystem")
+            Text("FILESYSTEM")
                 .capsLabel(color: Theme.textSecondary)
                 .tracking(3)
             Spacer()
@@ -63,7 +63,7 @@ struct SidebarView: View {
                 Image(systemName: "tray")
                     .font(.system(size: 22, weight: .ultraLight))
                     .foregroundStyle(Theme.textTertiary)
-                Text("no folder open")
+                Text("NO FOLDER OPEN")
                     .capsLabel(color: Theme.textTertiary)
                 Spacer()
             }
@@ -75,7 +75,7 @@ struct SidebarView: View {
 private struct NodeRow: View {
 
     let node: FileSystemNode
-    @ObservedObject var viewModel: BrowserViewModel
+    var viewModel: BrowserViewModel
 
     private var isCurrent: Bool { viewModel.currentURL == node.url }
     private var isSelected: Bool { viewModel.selectedURL == node.url }
@@ -102,10 +102,9 @@ private struct NodeRow: View {
             Spacer(minLength: 6)
 
             if isCurrent {
-                Text("here")
+                Text("HERE")
                     .font(Theme.caps(8))
                     .tracking(1.6)
-                    .textCase(.uppercase)
                     .foregroundStyle(Theme.folder.opacity(0.9))
                     .padding(.trailing, 4)
             }
