@@ -32,16 +32,8 @@ struct SceneBuilderTests {
         #expect(color == FileKind.code.sceneColor)
     }
 
-    // MARK: - Layout math
 
-    @Test func subdirTileWidthGrowsWithCountAndClamps() {
-        let empty = SceneBuilder.subdirTileWidth(itemCount: 0)
-        let small = SceneBuilder.subdirTileWidth(itemCount: 10)
-        let huge = SceneBuilder.subdirTileWidth(itemCount: 1_000_000)
-        #expect(empty == SceneBuilder.fileBaseWidth)          // empty folder = file-sized
-        #expect(small > empty)                                // fuller reads bigger
-        #expect(huge == SceneBuilder.fileBaseWidth * 2.4)     // clamped at 2.4×
-    }
+    // MARK: - Layout math
 
     @Test func slabHeightClampsToBudget() {
         let budget = SceneBuilder.fileMaxHeight

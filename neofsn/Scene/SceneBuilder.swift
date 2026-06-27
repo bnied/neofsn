@@ -42,30 +42,30 @@ enum SceneBuilder {
     // them by the same readable gap. The selection ring is sized from each item's
     // own footprint (see `SceneHostView.moveSpotlight`), so the gap doesn't double
     // as a halo budget — it's purely breathing room between items.
-    static let cellSize: CGFloat = 2.2
-    static let cellSpacing: CGFloat = 1.0
-    static let fileBaseWidth: CGFloat = 1.7
+    static let cellSize: CGFloat = 1.0
+    static let cellSpacing: CGFloat = 0.4
+    static let fileBaseWidth: CGFloat = 1.0
     static let subdirPlatformHeight: CGFloat = 0.32
 
-    // Block-height budgets. Names are engraved on each item's camera-facing front
+    // Block heights. Names are engraved on each item's camera-facing front
     // edge (see `makeEdgeLabel`), so blocks are tall enough to give that rim room to
-    // read — and the taller range makes the log size-encoding read more dramatically,
-    // FSN-style. Capped so a tall block in front doesn't occlude its neighbors' faces.
+    // read.
     static let fileMaxHeight: CGFloat = 0.55        // root-level file slabs
 
-    /// Footprint of a subfolder tile, scaled (log) by how many items it holds so
-    /// fuller folders read as bigger. Clamped at the top so one dense folder can't
-    /// blow out the level grid. An empty folder is the same size as a file slab.
-    static func subdirTileWidth(itemCount: Int) -> CGFloat {
-        let scale = 1.0 + min(1.4, log10(Double(max(itemCount, 1))) * 0.7)  // 1.0× … 2.4×
-        return fileBaseWidth * scale
+    /// Map a file's byte size to a slab height on a log scale, clamped to `maxH`.
+    /// The floor (0.24) keeps even tiny files tall enough for a legible engraved rim;
+    /// the slope spreads the common KB–GB range across the height budget.
+    static func slabHeight(forSize size: Int64, max maxH: CGFloat) -> CGFloat {
+        let clamped = Swift.max(1, Double(size))
+        let h = log10(clamped) * 0.08
+        return CGFloat(Swift.min(Double(maxH), Swift.max(0.24, h)))
     }
 
     struct LayoutMetrics {
         let halfExtent: CGFloat
     }
 
-    static let floorThickness: CGFloat = 0.5
+    static let floorThickness: CGFloat = 0.15
 
     /// Build a self-contained "level" node for one folder: a finite floor plate with
     /// the folder's items laid out on top. The node is centered at its own origin
@@ -96,14 +96,8 @@ enum SceneBuilder {
 
         let cols = max(1, Int(ceil(sqrt(Double(max(items.count, 1))))))
         let rows = max(1, Int(ceil(Double(max(items.count, 1)) / Double(cols))))
-        // Folder tiles grow with their item count, so the grid step has to track the
-        // widest item on this level (a file is `fileBaseWidth`); otherwise a big
-        // folder would slop into its neighbors.
-        var maxItemWidth = fileBaseWidth
-        for case .subdir(let n) in items {
-            maxItemWidth = max(maxItemWidth, subdirTileWidth(itemCount: n.children.count))
-        }
-        let step = maxItemWidth + cellSpacing
+        // All items have fixed width `fileBaseWidth`.
+        let step = fileBaseWidth + cellSpacing
         let halfExtent = max(CGFloat(cols), CGFloat(rows)) * step / 2
 
         level.addChildNode(makeFloorPlate(halfExtent: halfExtent))
@@ -162,7 +156,7 @@ enum SceneBuilder {
     private static func makeBackNode(parentURL: URL, plateHalf: CGFloat, cornerRadius: CGFloat) -> SCNNode {
         // Big enough that its rounded NW corner can adopt the plate's corner radius.
         let size = max(fileBaseWidth, cornerRadius + fileBaseWidth * 0.6)
-        let height: CGFloat = 0.18   // a low pad, not a tower
+        let height: CGFloat = floorThickness   // flush with the floor
 
         // Square footprint whose top-left (→ world NW) corner matches the plate's
         // corner radius; the other corners get just a soft round.
@@ -171,7 +165,7 @@ enum SceneBuilder {
             blRadius: 0.05, brRadius: 0.05, trRadius: 0.05, tlRadius: cornerRadius
         )
         let geom = SCNShape(path: path, extrusionDepth: height)
-        geom.chamferRadius = 0.012
+        geom.chamferRadius = 0.04
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
         // Warm amber, distinct from blue folders and the file colors.
@@ -183,23 +177,24 @@ enum SceneBuilder {
         geom.firstMaterial = mat
 
         let node = SCNNode(geometry: geom)
-        // SCNShape lies in the XY plane extruding +Z; rotate -90° about X so it lies
-        // flat (footprint in XZ, height in Y), sitting on the floor (top at y = height).
+        // SCNShape lies in the XY plane extruding +Z. Its extrusion is centered.
+        // Rotate -90° about X so it lies flat (footprint in XZ, height in Y).
         node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
-        // Seat it in the NW corner: its rounded NW corner becomes concentric with the
-        // plate's, so its west/north edges sit flush along the plate's edges.
+        // Seat it in the NW corner. Because extrusion is centered, positioning its center
+        // at -height / 2 + 0.001 places its top surface exactly flush at Y = 0.001
+        // (just a tiny bit above the floor plate to prevent Z-fighting).
         let center = -plateHalf + size / 2
-        node.position = SCNVector3(center, 0, center)
+        node.position = SCNVector3(center, -height / 2 + 0.001, center)
         node.name = "navup"
         node.fsPayload = NodePayload(url: parentURL, name: parentURL.lastPathComponent)
         node.castsShadow = true
 
         // Centered back-arrow on the top face. The pad is already rotated to lie flat,
         // so the glyph needs no rotation of its own; +Z in the pad's local frame is
-        // world-up, so nudge it just above the extruded top.
+        // world-up. The pad's top face is at local Z = height / 2.
         if let icon = makeBackIconNode(width: size * 0.42) {
             icon.eulerAngles = SCNVector3Zero
-            icon.position = SCNVector3(0, 0, height + 0.006)
+            icon.position = SCNVector3(0, 0, height / 2 + 0.006)
             node.addChildNode(icon)
         }
 
@@ -277,9 +272,11 @@ enum SceneBuilder {
 
         let node = SCNNode(geometry: shape)
         // SCNShape lies in the XY plane extruding +Z; rotate -90° about X so it lies
-        // flat (footprint in XZ, thickness in Y), then drop it so the top is at y = 0.
+        // flat (footprint in XZ, thickness in Y). Extrusion is centered around the local
+        // origin, so the top face is at local Z = floorThickness / 2.
+        // Drop it by floorThickness / 2 so the top surface sits exactly at world y = 0.
         node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
-        node.position = SCNVector3(0, -floorThickness, 0)
+        node.position = SCNVector3(0, -floorThickness / 2, 0)
         node.name = "floor"
         node.castsShadow = true
         return node
@@ -420,8 +417,7 @@ enum SceneBuilder {
     /// Not drawing every nested file/folder is what keeps a deep tree cheap to
     /// build and render. The tile IS the named interactive node (click → descend).
     private static func makeSubdirNode(subdir: FileSystemNode) -> SCNNode {
-        // Footprint scales with how many items the folder holds.
-        let width = subdirTileWidth(itemCount: subdir.children.count)
+        let width = fileBaseWidth
         let height = subdirPlatformHeight
 
         let maxChamfer = max(0.001, height / 2 - 0.001)
@@ -784,15 +780,6 @@ enum SceneBuilder {
     }
 
     // MARK: - Size + age
-
-    /// Map a file's byte size to a slab height on a log scale, clamped to `maxH`.
-    /// The floor (0.24) keeps even tiny files tall enough for a legible engraved rim;
-    /// the slope spreads the common KB–GB range across the height budget.
-    static func slabHeight(forSize size: Int64, max maxH: CGFloat) -> CGFloat {
-        let clamped = Swift.max(1, Double(size))
-        let h = log10(clamped) * 0.08
-        return CGFloat(Swift.min(Double(maxH), Swift.max(0.24, h)))
-    }
 
     /// Dispatch to the requested color strategy for this slab.
     private static func colorForFile(_ file: FileSystemNode, mode: ColorMode) -> NSColor {
