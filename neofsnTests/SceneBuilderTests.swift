@@ -44,13 +44,14 @@ struct SceneBuilderTests {
     }
 
     @Test func slabHeightClampsToBudget() {
-        let tiny = SceneBuilder.slabHeight(forSize: 0, max: 0.18)
-        // log10(2000)·0.05 ≈ 0.165 — inside the 0.07…0.18 budget, so unclamped.
-        let mid = SceneBuilder.slabHeight(forSize: 2_000, max: 0.18)
-        let huge = SceneBuilder.slabHeight(forSize: .max, max: 0.18)
-        #expect(tiny == 0.07)            // floor
-        #expect(mid > tiny && mid < 0.18)
-        #expect(huge == 0.18)            // ceiling
+        let budget = SceneBuilder.fileMaxHeight
+        let tiny = SceneBuilder.slabHeight(forSize: 0, max: budget)
+        // log10(100_000)·0.08 = 0.40 — inside the 0.24…budget range, so unclamped.
+        let mid = SceneBuilder.slabHeight(forSize: 100_000, max: budget)
+        let huge = SceneBuilder.slabHeight(forSize: .max, max: budget)
+        #expect(tiny == 0.24)                // floor
+        #expect(mid > tiny && mid < budget)
+        #expect(huge == budget)              // ceiling
     }
 
     @Test func truncateToAspectShortensLongNamesWithEllipsis() {

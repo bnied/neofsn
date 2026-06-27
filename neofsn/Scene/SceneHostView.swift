@@ -568,8 +568,7 @@ struct SceneHostView: NSViewRepresentable {
         private func moveSpotlight(to target: SCNNode) {
             guard let wrapper = selectionRingNode, let inner = selectionRingInner else { return }
             let world = target.worldPosition
-            let halfH = boxHeight(target) / 2
-            let itemBaseY = world.y - halfH
+            let itemBaseY = world.y - CGFloat(target.position.y)
             let f = footprint(target)
             // Ring center sits AT the slab edge (no outward offset). The blurred
             // halo's outer falloff naturally extends slightly past the edge for
@@ -608,18 +607,20 @@ struct SceneHostView: NSViewRepresentable {
             SCNTransaction.commit()
         }
 
-        /// Largest horizontal extent of an interactive node's box geometry.
-        /// Falls back to one grid cell for non-box geometries.
+        /// Largest horizontal extent of an interactive node's geometry, used to size
+        /// the selection ring. Covers the flat-topped solids `SceneBuilder` emits
+        /// (rectangular cards, discs, holed discs); falls back to one grid cell.
         private func footprint(_ node: SCNNode) -> CGFloat {
-            if let box = node.geometry as? SCNBox {
+            switch node.geometry {
+            case let box as SCNBox:
                 return max(box.width, box.length)
+            case let cylinder as SCNCylinder:
+                return cylinder.radius * 2
+            case let tube as SCNTube:
+                return tube.outerRadius * 2
+            default:
+                return CGFloat(SceneBuilder.cellSize)
             }
-            return CGFloat(SceneBuilder.cellSize)
-        }
-
-        /// Vertical extent of an interactive node's box geometry (zero if not a box).
-        private func boxHeight(_ node: SCNNode) -> CGFloat {
-            (node.geometry as? SCNBox)?.height ?? 0
         }
 
         // MARK: - Focus request (sidebar → 3D)

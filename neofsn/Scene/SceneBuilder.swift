@@ -45,17 +45,13 @@ enum SceneBuilder {
     static let cellSize: CGFloat = 2.2
     static let cellSpacing: CGFloat = 1.0
     static let fileBaseWidth: CGFloat = 1.7
-    static let subdirPlatformHeight: CGFloat = 0.20
+    static let subdirPlatformHeight: CGFloat = 0.32
 
-    // Block-height budgets (kept low so tall neighbors don't occlude labels).
-    static let fileMaxHeight: CGFloat = 0.18        // root-level file slabs
-
-    // Width budget for a root-level file's name label. A file owns its slab plus
-    // the gap around it, so the label may spill slightly past the slab edge into
-    // that gap. The level grid always steps items by at least
-    // `fileBaseWidth + cellSpacing`, so two neighboring labels at 95% of that
-    // budget can never touch.
-    static var fileLabelMaxWidth: CGFloat { (fileBaseWidth + cellSpacing) * 0.95 }
+    // Block-height budgets. Names are engraved on each item's camera-facing front
+    // edge (see `makeEdgeLabel`), so blocks are tall enough to give that rim room to
+    // read — and the taller range makes the log size-encoding read more dramatically,
+    // FSN-style. Capped so a tall block in front doesn't occlude its neighbors' faces.
+    static let fileMaxHeight: CGFloat = 0.55        // root-level file slabs
 
     /// Footprint of a subfolder tile, scaled (log) by how many items it holds so
     /// fuller folders read as bigger. Clamped at the top so one dense folder can't
@@ -130,12 +126,14 @@ enum SceneBuilder {
             level.addChildNode(view)
         }
 
-        // Back control at the plate's NW corner (just outside the content grid),
-        // when there's a parent to navigate to. The framing includes this corner.
+        // Back control nestled into the plate's NW corner when there's a parent to
+        // navigate to. Its own NW corner is rounded to the plate's corner radius, so
+        // it follows the chamfer and seats flush into the corner instead of
+        // overhanging it. The framing includes this corner.
         if let parentURL {
-            let back = makeBackNode(parentURL: parentURL)
-            let nw = halfExtent + cellSpacing
-            back.position = SCNVector3(-nw, back.position.y, -nw)  // NW corner, on the floor
+            let plateHalf = halfExtent + cellSize
+            let cornerRadius = min(plateHalf * 2 * 0.06, 2.0)   // matches makeFloorPlate
+            let back = makeBackNode(parentURL: parentURL, plateHalf: plateHalf, cornerRadius: cornerRadius)
             level.addChildNode(back)
         }
 
@@ -155,43 +153,83 @@ enum SceneBuilder {
 
     // MARK: - Back-up control
 
-    /// The "up" control: a glowing amber back tile (dark back-arrow glyph + "back"),
-    /// placed at the plate's NW corner (not in the content grid). A bit larger than a
-    /// file tile so it reads at the far corner. Clicking navigates one level up; the
-    /// handler dispatches on the `navup` node name.
-    private static func makeBackNode(parentURL: URL) -> SCNNode {
-        let baseWidth = fileBaseWidth * 1.3
-        let height = fileMaxHeight * 0.6
+    /// The "up" control: a glowing amber back pad with a centered back-arrow glyph,
+    /// seated in the plate's NW corner. Its own NW corner is rounded to the plate's
+    /// corner radius so it nestles into the chamfer flush against the west/north
+    /// edges instead of overhanging. Clicking navigates one level up (the handler
+    /// dispatches on the `navup` node name). `plateHalf` is the plate's half-side and
+    /// `cornerRadius` its plan-view corner radius (both from `makeLevelNode`).
+    private static func makeBackNode(parentURL: URL, plateHalf: CGFloat, cornerRadius: CGFloat) -> SCNNode {
+        // Big enough that its rounded NW corner can adopt the plate's corner radius.
+        let size = max(fileBaseWidth, cornerRadius + fileBaseWidth * 0.6)
+        let height: CGFloat = 0.18   // a low pad, not a tower
 
-        let geom = SCNBox(width: baseWidth, height: height, length: baseWidth, chamferRadius: 0.03)
+        // Square footprint whose top-left (→ world NW) corner matches the plate's
+        // corner radius; the other corners get just a soft round.
+        let path = cornerRoundedRectPath(
+            width: size, height: size,
+            blRadius: 0.05, brRadius: 0.05, trRadius: 0.05, tlRadius: cornerRadius
+        )
+        let geom = SCNShape(path: path, extrusionDepth: height)
+        geom.chamferRadius = 0.012
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
         // Warm amber, distinct from blue folders and the file colors.
         mat.diffuse.contents = NSColor(calibratedRed: 0.78, green: 0.58, blue: 0.22, alpha: 1)
         mat.metalness.contents = 0.10
         mat.roughness.contents = 0.55
-        // Emissive so the tile self-illuminates as a glowing control.
+        // Emissive so the pad self-illuminates as a glowing control.
         mat.emission.contents = NSColor(calibratedRed: 0.70, green: 0.46, blue: 0.12, alpha: 1)
         geom.firstMaterial = mat
 
         let node = SCNNode(geometry: geom)
-        node.position = SCNVector3(0, height / 2, 0)
+        // SCNShape lies in the XY plane extruding +Z; rotate -90° about X so it lies
+        // flat (footprint in XZ, height in Y), sitting on the floor (top at y = height).
+        node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
+        // Seat it in the NW corner: its rounded NW corner becomes concentric with the
+        // plate's, so its west/north edges sit flush along the plate's edges.
+        let center = -plateHalf + size / 2
+        node.position = SCNVector3(center, 0, center)
         node.name = "navup"
         node.fsPayload = NodePayload(url: parentURL, name: parentURL.lastPathComponent)
         node.castsShadow = true
 
-        // Back-arrow glyph at the back half, "back" label at the front — dark for
-        // contrast on the bright amber tile.
-        let topY = height / 2 + 0.012
-        if let icon = makeBackIconNode(width: baseWidth * 0.42) {
-            icon.position = SCNVector3(0, topY, -(fileCapHeight / 2 + 0.04))
+        // Centered back-arrow on the top face. The pad is already rotated to lie flat,
+        // so the glyph needs no rotation of its own; +Z in the pad's local frame is
+        // world-up, so nudge it just above the extruded top.
+        if let icon = makeBackIconNode(width: size * 0.42) {
+            icon.eulerAngles = SCNVector3Zero
+            icon.position = SCNVector3(0, 0, height + 0.006)
             node.addChildNode(icon)
         }
-        let label = makeFlatLabel(text: "back", accent: false, maxWorldWidth: baseWidth * 0.9, dark: true)
-        label.position = SCNVector3(0, topY, baseWidth / 2 - fileCapHeight / 2 - 0.06)
-        node.addChildNode(label)
 
         return node
+    }
+
+    /// A closed rounded-rectangle path with an independent radius per corner, named
+    /// by position in the path's local XY plane (bottom-left, bottom-right, etc.).
+    /// Used to give the back pad one plate-matched corner and soft rounds elsewhere.
+    private static func cornerRoundedRectPath(
+        width: CGFloat, height: CGFloat,
+        blRadius: CGFloat, brRadius: CGFloat, trRadius: CGFloat, tlRadius: CGFloat
+    ) -> NSBezierPath {
+        let minX = -width / 2, maxX = width / 2
+        let minY = -height / 2, maxY = height / 2
+        let p = NSBezierPath()
+        p.move(to: NSPoint(x: minX, y: minY + blRadius))
+        p.appendArc(withCenter: NSPoint(x: minX + blRadius, y: minY + blRadius),
+                    radius: blRadius, startAngle: 180, endAngle: 270)
+        p.line(to: NSPoint(x: maxX - brRadius, y: minY))
+        p.appendArc(withCenter: NSPoint(x: maxX - brRadius, y: minY + brRadius),
+                    radius: brRadius, startAngle: 270, endAngle: 360)
+        p.line(to: NSPoint(x: maxX, y: maxY - trRadius))
+        p.appendArc(withCenter: NSPoint(x: maxX - trRadius, y: maxY - trRadius),
+                    radius: trRadius, startAngle: 0, endAngle: 90)
+        p.line(to: NSPoint(x: minX + tlRadius, y: maxY))
+        p.appendArc(withCenter: NSPoint(x: minX + tlRadius, y: maxY - tlRadius),
+                    radius: tlRadius, startAngle: 90, endAngle: 180)
+        p.close()
+        return p
     }
 
     private static func makeBackIconNode(width: CGFloat) -> SCNNode? {
@@ -247,15 +285,86 @@ enum SceneBuilder {
         return node
     }
 
+    /// File-type geometry. Every kind is a flat-topped, low, grid-aligned solid
+    /// (box, disc, or holed disc) so the design reads as one coherent system: the
+    /// flat icon + name label always sit cleanly on top, and height stays a faithful
+    /// log-encoding of file size across every shape. Type is conveyed by the
+    /// *silhouette* (portrait page, wide frame, round disc, …) plus the icon and the
+    /// type-palette color — not by swapping in mismatched 3D primitives.
+    ///
+    /// All shapes are vertically centered at `height / 2`, so the caller can treat
+    /// `height / 2` as both the node's Y position and its local top.
+    private static func fileGeometry(for kind: FileKind, baseWidth: CGFloat, height: CGFloat) -> SCNGeometry {
+        // A box's chamfer rounds every edge, so it's capped at half the smallest
+        // dimension — on a thin slab that's the height. Clamp to stay just under.
+        let maxChamfer = max(0.001, height / 2 - 0.001)
+        let card: (CGFloat, CGFloat, CGFloat) -> SCNBox = { w, l, c in
+            SCNBox(width: w, height: height, length: l, chamferRadius: min(c, maxChamfer))
+        }
+
+        switch kind {
+        case .code, .executable:
+            // Crisp square card — sharp corners read as "source / program".
+            return card(baseWidth, baseWidth, 0.015)
+
+        case .document:
+            // Portrait card (deeper than wide) — a sheet of paper standing in the grid.
+            return card(baseWidth * 0.72, baseWidth, 0.02)
+
+        case .video:
+            // Wide landscape card — a film frame / clapperboard.
+            return card(baseWidth, baseWidth * 0.6, 0.02)
+
+        case .image:
+            // Square card with softly-rounded corners — a framed photo.
+            return card(baseWidth * 0.95, baseWidth * 0.95, min(0.05, maxChamfer))
+
+        case .archive:
+            // Chunky, heavily-rounded square — a crate or sealed box.
+            return card(baseWidth * 0.92, baseWidth * 0.92, min(0.06, maxChamfer))
+
+        case .config:
+            // Compact square chip — settings stamped onto a small plate.
+            return card(baseWidth * 0.8, baseWidth * 0.8, 0.02)
+
+        case .web:
+            // Rounded square — a soft, globe-adjacent tile.
+            return card(baseWidth * 0.9, baseWidth * 0.9, min(0.05, maxChamfer))
+
+        case .hidden:
+            // Small, recessed square — a system file that keeps to itself.
+            return card(baseWidth * 0.68, baseWidth * 0.68, 0.02)
+
+        case .audio:
+            // Solid disc — a record / spun-up media file.
+            return SCNCylinder(radius: baseWidth * 0.46, height: height)
+
+        case .disk:
+            // Disc with a center hole — an optical / disk image.
+            return SCNTube(innerRadius: baseWidth * 0.14, outerRadius: baseWidth * 0.46, height: height)
+
+        case .folder:
+            // Folders are built by `makeSubdirNode`; included for exhaustiveness.
+            return card(baseWidth, baseWidth, 0.04)
+
+        case .other:
+            // Plain rounded card — the neutral default.
+            return card(baseWidth, baseWidth, 0.025)
+        }
+    }
+
     // MARK: - File slab
 
-    /// One file = a flat slab (wider than tall). The slab IS the named interactive node
-    /// so hover/click highlight works directly on its material. An icon plane sits on top.
+    /// One file = a flat-topped, low solid whose silhouette hints at its type (see
+    /// `fileGeometry`). The solid IS the named interactive node so hover/click
+    /// highlight works directly on its material; a flat icon plane and name label
+    /// sit on top.
     private static func makeFileNode(file: FileSystemNode, baseWidth: CGFloat, maxHeight: CGFloat, colorMode: ColorMode) -> SCNNode {
         let height = slabHeight(forSize: file.size, max: maxHeight)
         let color = colorForFile(file, mode: colorMode)
+        let kind = FileKind.classify(name: file.name, isDirectory: false)
 
-        let geom = SCNBox(width: baseWidth, height: height, length: baseWidth, chamferRadius: 0.03)
+        let geom = fileGeometry(for: kind, baseWidth: baseWidth, height: height)
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
         mat.diffuse.contents = color
@@ -274,23 +383,30 @@ enum SceneBuilder {
         // them all into the shadow map every frame is what froze the camera fly-in.
         node.castsShadow = baseWidth >= 1.0
 
-        // Full-size (root-level) files carry a name label on the slab's top surface,
-        // mirroring how folders are labelled. The icon moves to the back half and the
-        // label occupies the front strip so they don't overlap. Mini-files on subdir
-        // platforms are too small for a label — they keep a centered icon only.
+        // Full-size (root-level) files carry their name engraved on the camera-facing
+        // front edge, so the icon gets the whole top surface to itself (centered).
+        // Mini-files on subdir platforms are too small for a legible label — they keep
+        // a centered icon only.
         let labeled = baseWidth >= 1.0
         let topY = height / 2 + 0.012
 
-        let iconWidth = labeled ? baseWidth * 0.58 : baseWidth * 0.66
-        let iconZ: CGFloat = labeled ? -(fileCapHeight / 2 + 0.02) : 0
+        let iconWidth = labeled ? baseWidth * 0.6 : baseWidth * 0.66
         if let icon = makeFileIconNode(for: file, width: iconWidth) {
-            icon.position = SCNVector3(0, topY, iconZ)
+            icon.position = SCNVector3(0, topY, 0)
             node.addChildNode(icon)
         }
 
         if labeled {
-            let label = makeFlatLabel(text: file.name, accent: false, maxWorldWidth: fileLabelMaxWidth)
-            label.position = SCNVector3(0, topY, baseWidth / 2 - fileCapHeight / 2 - 0.04)
+            // Front (+Z) face of the actual geometry — picks up shape-specific widths
+            // (portrait pages, wide video frames, round discs) automatically.
+            let (gmin, gmax) = geom.boundingBox
+            let label = makeEdgeLabel(
+                text: file.name,
+                faceWidth: CGFloat(gmax.x - gmin.x),
+                faceHeight: height,
+                accent: false
+            )
+            label.position = SCNVector3(0, 0, CGFloat(gmax.z) + 0.003)
             node.addChildNode(label)
         }
 
@@ -308,7 +424,8 @@ enum SceneBuilder {
         let width = subdirTileWidth(itemCount: subdir.children.count)
         let height = subdirPlatformHeight
 
-        let geom = SCNBox(width: width, height: height, length: width, chamferRadius: 0.04)
+        let maxChamfer = max(0.001, height / 2 - 0.001)
+        let geom = SCNBox(width: width, height: height, length: width, chamferRadius: min(0.04, maxChamfer))
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
         // Folder sky-blue, matching `Theme.folder` so the in-scene plates read
@@ -324,16 +441,17 @@ enum SceneBuilder {
         node.fsPayload = NodePayload(url: subdir.url, name: subdir.name)
         node.castsShadow = true
 
-        // Folder glyph in the back half, name label in the front strip — mirrors
-        // the labeled-file layout so a folder reads as part of the same grid.
+        // Centered folder glyph on top, name engraved on the camera-facing front
+        // edge — mirrors the labeled-file layout so a folder reads as part of the
+        // same grid.
         let topY = height / 2 + 0.012
         if let icon = makeFolderGlyphNode(width: width * 0.5) {
-            icon.position = SCNVector3(0, topY, -(accentCapHeight / 2 + 0.02))
+            icon.position = SCNVector3(0, topY, 0)
             node.addChildNode(icon)
         }
 
-        let label = makeFlatLabel(text: subdir.name, accent: true, maxWorldWidth: width * 0.92)
-        label.position = SCNVector3(0, topY, width / 2 - accentCapHeight / 2 - 0.06)
+        let label = makeEdgeLabel(text: subdir.name, faceWidth: width, faceHeight: height, accent: true)
+        label.position = SCNVector3(0, 0, width / 2 + 0.003)
         node.addChildNode(label)
 
         return node
@@ -408,6 +526,142 @@ enum SceneBuilder {
             text: text, bold: accent, capHeight: capHeight,
             maxWorldWidth: maxWorldWidth, name: "label", dark: dark
         )
+    }
+
+    // Edge-label text height per line, in WORLD units. Constant across every block
+    // so labels read at a uniform size regardless of a file's size-encoded height —
+    // a big file and a small one get the same lettering, just on taller/shorter
+    // blocks. Small enough that two lines fit the shortest block's rim.
+    private static let edgeLineHeight: CGFloat = 0.1
+    private static let edgeMaxLines = 2
+
+    /// A name label standing on an item's camera-facing front edge (its +Z face),
+    /// reading like lettering etched into the rim. Unlike `makeFlatLabel` (which lies
+    /// flat on the floor in front of the item), this plane faces the default camera
+    /// directly, so the name travels with the slab's front edge instead of spilling
+    /// onto the floor.
+    ///
+    /// The name is set small and wrapped across up to `edgeMaxLines` lines, so a long
+    /// filename shows in full (or nearly so) instead of being clipped to a handful of
+    /// big characters. It's ellipsized only if it still overflows.
+    private static func makeEdgeLabel(text: String, faceWidth: CGFloat, faceHeight: CGFloat, accent: Bool) -> SCNNode {
+        // Constant world height per line, but never so tall that two lines overflow a
+        // short block's rim (a safety clamp; normal blocks are tall enough that it
+        // never engages, keeping the size uniform).
+        let worldLineHeight = min(edgeLineHeight, faceHeight * 0.42)
+        let maxLineWorldWidth = faceWidth * 0.94
+
+        let pointSize: CGFloat = 64
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.92)
+        shadow.shadowBlurRadius = pointSize * 0.16
+        shadow.shadowOffset = .zero
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: labelFont(size: pointSize, accent: accent),
+            .foregroundColor: NSColor(calibratedWhite: 0.99, alpha: 1),
+            .shadow: shadow,
+            .paragraphStyle: para,
+        ]
+
+        // Convert the world width budget into a pixel budget at the render point size,
+        // then wrap the name across up to `edgeMaxLines` lines.
+        let lineHeightPx = ("Ag" as NSString).size(withAttributes: attrs).height
+        let maxLineWidthPx = (maxLineWorldWidth / worldLineHeight) * lineHeightPx
+        let lines = wrapToLines(text, attrs: attrs, maxLineWidthPx: maxLineWidthPx, maxLines: edgeMaxLines)
+
+        let attrString = NSAttributedString(string: lines.joined(separator: "\n"), attributes: attrs)
+        let textSize = attrString.boundingRect(
+            with: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            context: nil
+        ).size
+
+        let padX = pointSize * 0.35
+        let padY = pointSize * 0.22
+        let wPx = max(1, ceil(textSize.width + padX * 2))
+        let hPx = max(1, ceil(textSize.height + padY * 2))
+        let image = renderBitmapImage(width: wPx, height: hPx) {
+            attrString.draw(
+                with: NSRect(x: padX, y: padY, width: textSize.width, height: textSize.height),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil
+            )
+        } ?? NSImage(size: NSSize(width: wPx, height: hPx))
+
+        // Scale so each rendered text line maps to `worldLineHeight`; the halo padding
+        // rides along so it isn't clipped.
+        let scale = (CGFloat(lines.count) * worldLineHeight) / max(textSize.height, 1)
+        let plane = SCNPlane(width: wPx * scale, height: hPx * scale)
+        let mat = SCNMaterial()
+        mat.diffuse.contents = image
+        mat.lightingModel = .constant
+        mat.isDoubleSided = true
+        mat.transparencyMode = .aOne
+        // Sit flush on the face: skip depth writes and read depth so nearer slabs
+        // still occlude it, but it never z-fights with the face it rides on.
+        mat.writesToDepthBuffer = false
+        mat.readsFromDepthBuffer = true
+        plane.firstMaterial = mat
+
+        let node = SCNNode(geometry: plane)
+        // SCNPlane already faces +Z (toward the default camera) — no rotation needed.
+        node.name = "label"
+        node.castsShadow = false
+        node.renderingOrder = 10
+        return node
+    }
+
+    /// Break `text` into at most `maxLines` lines that each fit `maxLineWidthPx`,
+    /// preferring to split at separators (space, dash, underscore, dot, parens) and
+    /// falling back to a mid-token break for runs with none. The final line is
+    /// ellipsized if the whole string still doesn't fit.
+    private static func wrapToLines(
+        _ text: String, attrs: [NSAttributedString.Key: Any], maxLineWidthPx: CGFloat, maxLines: Int
+    ) -> [String] {
+        func w(_ s: String) -> CGFloat { (s as NSString).size(withAttributes: attrs).width }
+        if w(text) <= maxLineWidthPx { return [text] }
+
+        let separators: Set<Character> = [" ", "-", "_", ".", "(", ")"]
+        var lines: [String] = []
+        var rest = Substring(text)
+
+        while !rest.isEmpty && lines.count < maxLines {
+            // Largest character prefix that fits the line width.
+            var lo = 1, hi = rest.count, fit = 1
+            while lo <= hi {
+                let mid = (lo + hi) / 2
+                if w(String(rest.prefix(mid))) <= maxLineWidthPx { fit = mid; lo = mid + 1 }
+                else { hi = mid - 1 }
+            }
+
+            if fit >= rest.count {
+                lines.append(String(rest)); rest = ""
+                break
+            }
+            if lines.count == maxLines - 1 {
+                // Last allowed line and more text remains — ellipsize it.
+                var n = fit
+                while n > 1 && w(String(rest.prefix(n)) + "\u{2026}") > maxLineWidthPx { n -= 1 }
+                lines.append(String(rest.prefix(n)) + "\u{2026}")
+                rest = ""
+                break
+            }
+
+            // Prefer a separator break within the fitting prefix, but not so early
+            // that most of the line is wasted.
+            let chars = Array(rest)
+            var brk = fit
+            var i = fit - 1
+            while i >= max(1, fit / 2) {
+                if separators.contains(chars[i]) { brk = i + 1; break }
+                i -= 1
+            }
+            lines.append(String(rest.prefix(brk)))
+            rest = rest.dropFirst(brk)
+        }
+        return lines
     }
 
     /// Shared label builder: renders `text` to a texture and lays it flat (facing up,
@@ -532,10 +786,12 @@ enum SceneBuilder {
     // MARK: - Size + age
 
     /// Map a file's byte size to a slab height on a log scale, clamped to `maxH`.
+    /// The floor (0.24) keeps even tiny files tall enough for a legible engraved rim;
+    /// the slope spreads the common KB–GB range across the height budget.
     static func slabHeight(forSize size: Int64, max maxH: CGFloat) -> CGFloat {
         let clamped = Swift.max(1, Double(size))
-        let h = log10(clamped) * 0.05
-        return CGFloat(Swift.min(Double(maxH), Swift.max(0.07, h)))
+        let h = log10(clamped) * 0.08
+        return CGFloat(Swift.min(Double(maxH), Swift.max(0.24, h)))
     }
 
     /// Dispatch to the requested color strategy for this slab.

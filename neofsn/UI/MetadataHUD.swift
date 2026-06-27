@@ -15,9 +15,11 @@ struct MetadataHUD: View {
     @State private var loaded: (url: URL, info: Info)?
 
     var body: some View {
-        Group {
+        ZStack {
             if let loaded {
                 panel(info: loaded.info, url: loaded.url)
+            } else {
+                Color.clear.frame(height: 1)
             }
         }
         .task(id: viewModel.actionableURL) {
