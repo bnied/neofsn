@@ -66,6 +66,10 @@ enum SceneBuilder {
     }
 
     static let floorThickness: CGFloat = 0.15
+    /// Curve tessellation for the floor plate and the back plug (which plugs a hole
+    /// cut from the plate, so the two must match). Corner radii are small (~0.5),
+    /// so anything coarse shows visible facets.
+    private static let floorPathFlatness: CGFloat = 0.01
 
     /// Build a self-contained "level" node for one folder: a finite floor plate with
     /// the folder's items laid out on top. The node is centered at its own origin
@@ -100,7 +104,21 @@ enum SceneBuilder {
         let step = fileBaseWidth + cellSpacing
         let halfExtent = max(CGFloat(cols), CGFloat(rows)) * step / 2
 
-        level.addChildNode(makeFloorPlate(halfExtent: halfExtent))
+        // Build the back control first (when there's a parent) so its footprint can be
+        // punched out of the floor plate — the control then plugs that hole and sits
+        // truly flush, with the plate's own chamfered hole edge framing it at the
+        // matching corner radius.
+        var backNode: SCNNode?
+        var floorCutout: NSBezierPath?
+        if let parentURL {
+            let plateHalf = halfExtent + cellSize
+            let cornerRadius = min(plateHalf * 2 * 0.06, 2.0)   // matches makeFloorPlate
+            let back = makeBackNode(parentURL: parentURL, plateHalf: plateHalf, cornerRadius: cornerRadius)
+            backNode = back.node
+            floorCutout = back.cutout
+        }
+
+        level.addChildNode(makeFloorPlate(halfExtent: halfExtent, cutout: floorCutout))
 
         let originX = -CGFloat(cols - 1) * step / 2
         let originZ = -CGFloat(rows - 1) * step / 2
@@ -120,15 +138,9 @@ enum SceneBuilder {
             level.addChildNode(view)
         }
 
-        // Back control nestled into the plate's NW corner when there's a parent to
-        // navigate to. Its own NW corner is rounded to the plate's corner radius, so
-        // it follows the chamfer and seats flush into the corner instead of
-        // overhanging it. The framing includes this corner.
-        if let parentURL {
-            let plateHalf = halfExtent + cellSize
-            let cornerRadius = min(plateHalf * 2 * 0.06, 2.0)   // matches makeFloorPlate
-            let back = makeBackNode(parentURL: parentURL, plateHalf: plateHalf, cornerRadius: cornerRadius)
-            level.addChildNode(back)
+        // Add the back control (built above) — it plugs the hole cut into the plate.
+        if let backNode {
+            level.addChildNode(backNode)
         }
 
         // Empty-folder message, centered on the floor when there are no real children.
@@ -153,52 +165,67 @@ enum SceneBuilder {
     /// edges instead of overhanging. Clicking navigates one level up (the handler
     /// dispatches on the `navup` node name). `plateHalf` is the plate's half-side and
     /// `cornerRadius` its plan-view corner radius (both from `makeLevelNode`).
-    private static func makeBackNode(parentURL: URL, plateHalf: CGFloat, cornerRadius: CGFloat) -> SCNNode {
+    private static func makeBackNode(
+        parentURL: URL, plateHalf: CGFloat, cornerRadius: CGFloat
+    ) -> (node: SCNNode, cutout: NSBezierPath) {
         // Big enough that its rounded NW corner can adopt the plate's corner radius.
         let size = max(fileBaseWidth, cornerRadius + fileBaseWidth * 0.6)
-        let height: CGFloat = floorThickness   // flush with the floor
+        let center = -plateHalf + size / 2
 
-        // Square footprint whose top-left (→ world NW) corner matches the plate's
-        // corner radius; the other corners get just a soft round.
-        let path = cornerRoundedRectPath(
+        // Footprint whose top-left (→ world NW) corner matches the plate's corner
+        // radius; the other corners get just a soft round. The same footprint is the
+        // button geometry AND (translated) the hole punched in the plate, so the
+        // button plugs the hole exactly.
+        let footprint = cornerRoundedRectPath(
             width: size, height: size,
             blRadius: 0.05, brRadius: 0.05, trRadius: 0.05, tlRadius: cornerRadius
         )
-        let geom = SCNShape(path: path, extrusionDepth: height)
-        geom.chamferRadius = 0.04
+        // Match the plate's tessellation (the cutout inherits the plate path's
+        // flatness); the 0.6 default collapses the corner arc to a single chord.
+        footprint.flatness = floorPathFlatness
+
+        // Crisp plug — the visible bevel around it comes from the plate's chamfered
+        // hole edge (which, being cut from the plate, matches the plate's chamfer
+        // exactly). A whisper of chamfer just avoids a hard aliased top edge.
+        let geom = SCNShape(path: footprint, extrusionDepth: floorThickness)
+        geom.chamferRadius = 0.006
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
         // Warm amber, distinct from blue folders and the file colors.
         mat.diffuse.contents = NSColor(calibratedRed: 0.78, green: 0.58, blue: 0.22, alpha: 1)
         mat.metalness.contents = 0.10
         mat.roughness.contents = 0.55
-        // Emissive so the pad self-illuminates as a glowing control.
+        // Emissive so the control self-illuminates.
         mat.emission.contents = NSColor(calibratedRed: 0.70, green: 0.46, blue: 0.12, alpha: 1)
         geom.firstMaterial = mat
 
         let node = SCNNode(geometry: geom)
-        // SCNShape lies in the XY plane extruding +Z. Its extrusion is centered.
-        // Rotate -90° about X so it lies flat (footprint in XZ, height in Y).
+        // Rotate -90° about X to lie flat (footprint in XZ). Extrusion is centered, so
+        // a center at -floorThickness/2 + 0.001 makes the plug's top sit flush with the
+        // plate surface (y ≈ 0) while its body fills the punched hole, top to bottom.
         node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
-        // Seat it in the NW corner. Because extrusion is centered, positioning its center
-        // at -height / 2 + 0.001 places its top surface exactly flush at Y = 0.001
-        // (just a tiny bit above the floor plate to prevent Z-fighting).
-        let center = -plateHalf + size / 2
-        node.position = SCNVector3(center, -height / 2 + 0.001, center)
+        node.position = SCNVector3(center, -floorThickness / 2 + 0.001, center)
         node.name = "navup"
         node.fsPayload = NodePayload(url: parentURL, name: parentURL.lastPathComponent)
-        node.castsShadow = true
+        node.castsShadow = false   // flush plug — no resting-on-top shadow
 
-        // Centered back-arrow on the top face. The pad is already rotated to lie flat,
-        // so the glyph needs no rotation of its own; +Z in the pad's local frame is
-        // world-up. The pad's top face is at local Z = height / 2.
+        // Centered back-arrow just above the flush top face (local Z = floorThickness/2).
         if let icon = makeBackIconNode(width: size * 0.42) {
             icon.eulerAngles = SCNVector3Zero
-            icon.position = SCNVector3(0, 0, height / 2 + 0.006)
+            icon.position = SCNVector3(0, 0, floorThickness / 2 + 0.006)
             node.addChildNode(icon)
         }
 
-        return node
+        // The matching hole in the plate. The floor lies in the same XY plane but is
+        // rotated the same way, so world +X → path X and world +Z → path -Y; translate
+        // the footprint to the button's world center under that mapping.
+        let cutout = cornerRoundedRectPath(
+            width: size, height: size,
+            blRadius: 0.05, brRadius: 0.05, trRadius: 0.05, tlRadius: cornerRadius
+        )
+        cutout.transform(using: AffineTransform(translationByX: center, byY: -center))
+
+        return (node, cutout)
     }
 
     /// A closed rounded-rectangle path with an independent radius per corner, named
@@ -253,13 +280,19 @@ enum SceneBuilder {
     /// Finite floor plate, sized to the grid, with its top surface at local y = 0.
     /// Built as an extruded rounded rectangle so the plate reads as a round-rect
     /// (a chamfered `SCNBox` can only round corners up to half its thickness).
-    private static func makeFloorPlate(halfExtent: CGFloat) -> SCNNode {
+    private static func makeFloorPlate(halfExtent: CGFloat, cutout: NSBezierPath? = nil) -> SCNNode {
         let side = (halfExtent + cellSize) * 2
         let cornerRadius = min(side * 0.06, 2.0)
 
         let rect = NSRect(x: -side / 2, y: -side / 2, width: side, height: side)
         let path = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
-        path.flatness = 0.1   // smooth corner tessellation
+        path.flatness = floorPathFlatness   // smooth corner tessellation
+        // A cutout subpath punches a hole the back control plugs, so the control sits
+        // truly flush and the plate's own chamfered hole edge frames it.
+        if let cutout {
+            path.append(cutout)
+            path.windingRule = .evenOdd
+        }
         let shape = SCNShape(path: path, extrusionDepth: floorThickness)
         shape.chamferRadius = 0.04   // softens the top/bottom rim
 
